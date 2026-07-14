@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/rendering.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_scene/scene.dart';
 import 'text/sdf/atlas_generator.dart';
 import 'text/sdf/atlas_provider.dart';
@@ -57,7 +57,7 @@ class TileUiModel {
 /// this class is stateful, designed to be reused for rendering a tile
 /// multiple times.
 ///
-class TilesRenderer {
+class TilesRenderer with WidgetsBindingObserver {
   static final Completer<void> _initializer = Completer<void>();
   static Future<void> initialize = _initializer.future;
 
@@ -71,6 +71,11 @@ class TilesRenderer {
   Scene? _scene;
 
   TilesRenderer(this.theme) {
+    // Listen for OS memory pressure so we can drop the off-screen GPU tile
+    // cache before the Vulkan allocator runs out of device memory. flutter_gpu
+    // textures have no explicit dispose(); the only way to reclaim their GPU
+    // memory is to drop every Dart reference and let the GC collect them.
+    WidgetsBinding.instance.addObserver(this);
     if (!_initializer.isCompleted) {
       // flutter_scene's base shader bundle and our tile shader bundle both load
       // asynchronously (shader assets can't be read synchronously on any
@@ -191,5 +196,26 @@ class TilesRenderer {
     return scene;
   }
 
-  void dispose() {}
+  @override
+  void didHaveMemoryPressure() {
+    // The OS is under memory pressure. Drop the off-screen tile-node cache and
+    // any glyph atlases/textures that aren't backing a currently visible tile,
+    // so the GC can reclaim their GPU memory. Visible tiles keep their atlases;
+    // revisited tiles simply re-render (progressive), rather than crashing the
+    // GPU driver with an out-of-device-memory allocation.
+    _cachedNodes.clear();
+    _atlasGenerator.unloadWhereNotFound(_positionByKey.keys.toSet());
+  }
+
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _scene?.root.removeAll();
+    _scene = null;
+    _cachedNodes.clear();
+    _positionByKey.clear();
+    // Release every retained glyph atlas and its GPU texture. Without this a
+    // theme switch or layer teardown leaks a full set of GPU resources until
+    // the whole renderer is garbage collected.
+    _atlasGenerator.unloadWhereNotFound(const <String>{});
+  }
 }

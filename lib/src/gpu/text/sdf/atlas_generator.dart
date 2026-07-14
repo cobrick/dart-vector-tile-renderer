@@ -36,8 +36,15 @@ class AtlasGenerator {
   void unloadWhereNotFound(Set<String> tileIDs) {
     final stillLoaded = atlasProvider.unloadWhereNotFound(tileIDs);
     final stillLoadedIDs = stillLoaded.map((it) => it.id).toSet();
-    final toRemove =
-        _loading.keys.where((id) => !stillLoadedIDs.contains(id)).toList();
+    // Keep entries whose generation is still in flight. Dropping an in-flight
+    // completer here means a tile that scrolls away and back mid-generation
+    // re-enqueues a duplicate SDF render + texture upload for the same atlas.
+    // Completed-but-unneeded entries are still removed, and an in-flight entry
+    // is cleaned up on the next call once its generation has finished.
+    final toRemove = _loading.keys
+        .where(
+            (id) => !stillLoadedIDs.contains(id) && _loading[id]!.isCompleted)
+        .toList();
 
     for (var id in toRemove) {
       _loading.remove(id);
