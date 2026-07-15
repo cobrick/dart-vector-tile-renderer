@@ -63,4 +63,14 @@ class GpuMapSettings {
   /// Experimental: the map's orthographic camera does not yet produce a tight
   /// view frustum, so enabling this can drop visible tiles — verify on-device.
   static bool frustumCulling = false;
+
+  /// Whether to skip drawing tiles that fall entirely outside the viewport.
+  ///
+  /// Unlike [frustumCulling] (which relies on the 3D camera frustum), this is a
+  /// cheap 2D test against the viewport in screen space: a tile is hidden only
+  /// when its screen rect lies beyond the circle enclosing the viewport, so it
+  /// is correct at any map rotation and never hides a visible tile. Culled
+  /// tiles stay uploaded in the scene (only [Node.visible] is toggled), so
+  /// nothing pops — only their per-frame draw is skipped.
+  static bool viewportCulling = true;
 }

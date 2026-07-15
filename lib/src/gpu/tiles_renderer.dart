@@ -24,6 +24,16 @@ AntiAliasingMode _sceneAntiAliasing(MapAntiAliasing aa) => switch (aa) {
       MapAntiAliasing.auto => AntiAliasingMode.auto,
     };
 
+/// Squared distance from point [p] to the nearest edge/corner of [r] (0 when
+/// [p] is inside [r]). Used for the viewport cull without a sqrt.
+double _distanceSquaredToRect(Offset p, Rect r) {
+  final dx =
+      p.dx < r.left ? r.left - p.dx : (p.dx > r.right ? p.dx - r.right : 0.0);
+  final dy =
+      p.dy < r.top ? r.top - p.dy : (p.dy > r.bottom ? p.dy - r.bottom : 0.0);
+  return dx * dx + dy * dy;
+}
+
 class TileId {
   final int z;
   final int x;
@@ -63,6 +73,12 @@ class TilesRenderer with WidgetsBindingObserver {
 
   final _positionByKey = <String, Rect>{};
   final _cachedNodes = <String, Node>{};
+
+  // The visible tile keys built into the scene by the last [update], and
+  // whether that update deferred any tile (upload budget). Used to skip the
+  // scene teardown/rebuild when the visible set has not changed.
+  Set<String> _lastTileKeys = const {};
+  bool _lastUpdateDeferred = false;
   final AtlasProvider _atlasProvider = AtlasProvider();
   final TextureProvider _textureProvider = TextureProvider();
   late final _atlasGenerator = AtlasGenerator(
@@ -121,6 +137,30 @@ class TilesRenderer with WidgetsBindingObserver {
       _cachedNodes.clear();
     }
     final scene = this.scene;
+
+    // Fast path: the visible tile set is identical to the last update and that
+    // update built all of it (nothing deferred by the upload budget), so the
+    // scene graph already holds exactly these nodes. Only the tile positions
+    // change frame to frame while the map moves — refresh those and skip the
+    // teardown/rebuild, node caching, and atlas prune (the set is unchanged, so
+    // there is nothing to cache or unload). A set change or a pending deferral
+    // falls through to the full rebuild below.
+    if (!_lastUpdateDeferred && models.length == _lastTileKeys.length) {
+      var sameSet = true;
+      for (final model in models) {
+        if (!_lastTileKeys.contains(model.tileId.key())) {
+          sameSet = false;
+          break;
+        }
+      }
+      if (sameSet) {
+        for (final model in models) {
+          _positionByKey[model.tileId.key()] = model.position;
+        }
+        return;
+      }
+    }
+
     final activeNodesByKey =
         Map.fromEntries(scene.root.children.map((n) => MapEntry(n.name, n)));
     scene.root.removeAll();
@@ -128,8 +168,9 @@ class TilesRenderer with WidgetsBindingObserver {
     final currentTileKeys = <String>{};
     final uploadBudget = GpuMapSettings.maxTileUploadsPerUpdate;
     var newUploads = 0;
+    var deferred = false;
     for (final model in models) {
-      final key = 'z=${model.tileId.z},x=${model.tileId.x},y=${model.tileId.y}';
+      final key = model.tileId.key();
       currentTileKeys.add(key);
       var node = activeNodesByKey[key] ?? _cachedNodes.remove(key);
       if (node == null) {
@@ -139,6 +180,7 @@ class TilesRenderer with WidgetsBindingObserver {
         // still display-ready and get built on a later update; the previous
         // tile pyramid keeps covering their area meanwhile.
         if (uploadBudget > 0 && newUploads >= uploadBudget) {
+          deferred = true;
           continue;
         }
         final renderData = model.renderData;
@@ -160,6 +202,9 @@ class TilesRenderer with WidgetsBindingObserver {
         _cacheNode(entry.key, entry.value);
       }
     }
+
+    _lastTileKeys = currentTileKeys;
+    _lastUpdateDeferred = deferred;
 
     _atlasGenerator.unloadWhereNotFound({
       ...tileIDs,
@@ -191,11 +236,28 @@ class TilesRenderer with WidgetsBindingObserver {
     final pixelRatio = view.display.devicePixelRatio;
     canvas.scale(1 / pixelRatio);
 
+    // Draw-time viewport cull. The map rotates about the viewport centre, so a
+    // tile whose nearest point is beyond the circle enclosing the viewport
+    // (half the viewport diagonal, plus a safety margin) cannot be visible at
+    // any rotation. Culled tiles are only hidden (visible=false) — they stay
+    // uploaded in the scene, so nothing pops and only the per-frame draw is
+    // skipped.
+    final cull = GpuMapSettings.viewportCulling;
+    final center = Offset(size.width / 2, size.height / 2);
+    const cullMargin = 0.15;
+    final cullRadiusSquared = 0.25 *
+        (size.width * size.width + size.height * size.height) *
+        (1 + cullMargin) *
+        (1 + cullMargin);
+
     for (final node in scene.root.children) {
       final position = _positionByKey[node.name];
-      if (position != null) {
-        node.localTransform = tileTransformMatrix(position, size, rotation);
+      if (position == null) {
+        continue;
       }
+      node.localTransform = tileTransformMatrix(position, size, rotation);
+      node.visible = !cull ||
+          _distanceSquaredToRect(center, position) <= cullRadiusSquared;
     }
     scene.render(OrthographicCamera(pixelRatio, rotation), canvas,
         viewport: ui.Offset.zero & canvas.getLocalClipBounds().size);
