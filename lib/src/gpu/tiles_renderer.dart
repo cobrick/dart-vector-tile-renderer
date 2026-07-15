@@ -126,19 +126,30 @@ class TilesRenderer with WidgetsBindingObserver {
     scene.root.removeAll();
     _positionByKey.clear();
     final currentTileKeys = <String>{};
+    final uploadBudget = GpuMapSettings.maxTileUploadsPerUpdate;
+    var newUploads = 0;
     for (final model in models) {
       final key = 'z=${model.tileId.z},x=${model.tileId.x},y=${model.tileId.y}';
       currentTileKeys.add(key);
       var node = activeNodesByKey[key] ?? _cachedNodes.remove(key);
       if (node == null) {
-        node = Node(name: key);
+        // Brand-new tile: unpacking uploads its geometry to the GPU
+        // synchronously. Cap uploads per update so a burst of new tiles (e.g. a
+        // fast multi-level zoom) can't freeze the UI thread. Deferred tiles are
+        // still display-ready and get built on a later update; the previous
+        // tile pyramid keeps covering their area meanwhile.
+        if (uploadBudget > 0 && newUploads >= uploadBudget) {
+          continue;
+        }
         final renderData = model.renderData;
         if (renderData == null) {
           throw Exception(
               "no render data for tile ${model.tileId}, did you call preRender?");
         }
+        node = Node(name: key);
         BucketUnpacker(_textureProvider, model.rasterTileset)
             .unpackOnto(node, TileRenderData.unpack(renderData));
+        newUploads++;
       }
       _positionByKey[key] = model.position;
       scene.add(node);
