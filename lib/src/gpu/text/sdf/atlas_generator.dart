@@ -1,8 +1,8 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'dart:math' as math;
-import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import '../../shaders.dart';
@@ -17,23 +17,66 @@ import 'glyph_atlas_data.dart';
 /// Builds the glyph atlas for an [AtlasID], or returns `null` to withhold it.
 typedef AtlasGeneratorFunction = Future<GlyphAtlas?> Function(AtlasID id);
 
+/// How many glyphs are measured or recorded before yielding to the event
+/// loop, so building a large atlas doesn't block the UI thread in one piece.
+const glyphsPerSlice = 32;
+
 class AtlasGenerator {
   final _loading = <AtlasID, Completer<GlyphAtlas?>>{};
   static Future<void> _generationTail = Future.value();
   static final _stats = GlyphAtlasStats();
 
+  /// The most characters a union atlas grows to: a 16×16 grid. Past it, a
+  /// font uses per-tile atlases holding only the requested characters, for
+  /// the rest of the generator's life.
+  static const maxAtlasChars = 256;
+
+  /// A font's union starts including the base set once the font has needed
+  /// this many distinct characters. The main label font gets there on its
+  /// first tile; fonts that serve one small layer (motorway refs, water
+  /// names) keep small atlases instead of ~7 MB ones.
+  static const defaultBaseSeedThreshold = 32;
+
+  /// The base set of a font's union: ASCII, Latin-1 letters, common
+  /// punctuation and the Central European letters of Latin Extended-A
+  /// (Polish, Czech, Slovak, Hungarian). Danish and German are covered by
+  /// Latin-1. 214 characters.
+  static final String defaultBaseChars = String.fromCharCodes(<int>[
+    for (var c = 0x20; c <= 0x7E; c++) c,
+    for (var c = 0xC0; c <= 0xFF; c++)
+      if (c != 0xD7 && c != 0xF7) c,
+    ...'\u00A0«»·°–—‘’“”„…'.codeUnits,
+    ...'ĄąĆćČčĎďĘęĚěĹĺĽľŁłŃńŇňŐőŔŕŘřŚśŠšŤťŮůŰűŹźŻżŽž'.codeUnits,
+  ]);
+
   final AtlasProvider atlasProvider;
   final TextureProvider textureProvider;
   final AtlasGeneratorFunction? _generate;
   final Future<void> Function() _nextFrame;
+  final String _baseChars;
+  final int _baseSeedThreshold;
+
+  /// Every character requested per font so far, so a new union covers all
+  /// of them and later tiles reuse it instead of building their own.
+  final _seenByFont = <String, SplayTreeSet<int>>{};
+
+  /// The latest union per font, so concurrent misses wait for it.
+  final _unionByFont = <String, AtlasID>{};
+
+  /// Fonts that passed [maxAtlasChars] and use per-tile atlases from now on.
+  final _overflowedFonts = <String>{};
 
   AtlasGenerator({
     required this.atlasProvider,
     required this.textureProvider,
     @visibleForTesting AtlasGeneratorFunction? generate,
     @visibleForTesting Future<void> Function()? nextFrame,
+    @visibleForTesting String? baseChars,
+    @visibleForTesting int? baseSeedThreshold,
   })  : _generate = generate,
-        _nextFrame = nextFrame ?? _endOfFrame;
+        _nextFrame = nextFrame ?? _endOfFrame,
+        _baseChars = baseChars ?? defaultBaseChars,
+        _baseSeedThreshold = baseSeedThreshold ?? defaultBaseSeedThreshold;
 
   static Future<void> _endOfFrame() => SchedulerBinding.instance.endOfFrame;
 
@@ -48,12 +91,33 @@ class AtlasGenerator {
       {required String str,
       required String fontFamily,
       required String tileID}) async {
-    final existingEntry = _loading.entries
-        .firstWhereOrNull((entry) => entry.key.canBeUsedFor(str, fontFamily));
-
-    final atlas = existingEntry != null
-        ? await existingEntry.value.future
-        : await _loadAtlas(AtlasID(chars: str, font: fontFamily));
+    GlyphAtlas? atlas;
+    while (true) {
+      final covering = _bestCovering(str, fontFamily);
+      if (covering != null) {
+        atlas = await covering.future;
+        break;
+      }
+      final pending = _pendingUnion(fontFamily);
+      if (pending != null) {
+        // Don't queue a union per tile while one is in flight: record what
+        // this tile needs, wait, and look again. The first tile to retry
+        // builds one union covering every tile that waited.
+        _seen(fontFamily).addAll(str.codeUnits);
+        await pending.future;
+        continue;
+      }
+      final id =
+          AtlasID(chars: _charsToBuild(str, fontFamily), font: fontFamily);
+      atlas = await _loadAtlas(id);
+      if (atlas == null && id.chars != str) {
+        // A withheld union would drop this font's labels on every tile
+        // waiting on it. This tile's own characters make a much smaller
+        // atlas, so try them once.
+        atlas = await _loadAtlas(AtlasID(chars: str, font: fontFamily));
+      }
+      break;
+    }
 
     // A withheld atlas was logged where it failed. Text layout drops every
     // label of this tile that needs one of its characters, and the tile keeps
@@ -63,6 +127,65 @@ class AtlasGenerator {
       return;
     }
     atlasProvider.addLoaded({atlas}, tileID);
+  }
+
+  /// The atlas to reuse for [str]: a completed one before an in-flight one,
+  /// then the one with the most characters, so tiles converge on the newest
+  /// union and older ones age out.
+  Completer<GlyphAtlas?>? _bestCovering(String str, String font) {
+    MapEntry<AtlasID, Completer<GlyphAtlas?>>? best;
+    for (final entry in _loading.entries) {
+      if (!entry.key.canBeUsedFor(str, font)) {
+        continue;
+      }
+      if (best == null) {
+        best = entry;
+        continue;
+      }
+      final done = entry.value.isCompleted;
+      if (done != best.value.isCompleted) {
+        if (done) {
+          best = entry;
+        }
+        continue;
+      }
+      if (entry.key.chars.length > best.key.chars.length) {
+        best = entry;
+      }
+    }
+    return best?.value;
+  }
+
+  Completer<GlyphAtlas?>? _pendingUnion(String font) {
+    final id = _unionByFont[font];
+    final completer = id == null ? null : _loading[id];
+    return completer != null && !completer.isCompleted ? completer : null;
+  }
+
+  SplayTreeSet<int> _seen(String font) =>
+      _seenByFont.putIfAbsent(font, SplayTreeSet<int>.new);
+
+  /// The characters for a new atlas of [font] that must cover [str]: every
+  /// character seen for [font] so far plus [str], and the base set once the
+  /// font has needed [_baseSeedThreshold] characters. Falls back to [str]
+  /// alone, for good, once that union would pass [maxAtlasChars].
+  String _charsToBuild(String str, String font) {
+    if (_overflowedFonts.contains(font)) {
+      return str;
+    }
+    final seen = _seen(font)..addAll(str.codeUnits);
+    if (seen.length >= _baseSeedThreshold) {
+      seen.addAll(_baseChars.codeUnits);
+    }
+    if (seen.length > maxAtlasChars) {
+      _overflowedFonts.add(font);
+      GlyphAtlasStats.log(() => 'Glyph atlases for $font passed '
+          '$maxAtlasChars characters; using per-tile atlases from now on');
+      return str;
+    }
+    final chars = String.fromCharCodes(seen);
+    _unionByFont[font] = AtlasID(chars: chars, font: font);
+    return chars;
   }
 
   void unloadWhereNotFound(Set<String> tileIDs) {
@@ -141,10 +264,15 @@ class AtlasGenerator {
     final renderFontSize = fontSize * config.renderScale;
 
     final charCodes = id.chars.codeUnits;
-    final metrics = <int, GlyphMetrics>{
-      for (var code in charCodes)
-        code: metricsExtractor.extractMetrics(code, cellSize, cellSize)
-    };
+    final metrics = <int, GlyphMetrics>{};
+    for (var i = 0; i < charCodes.length; i++) {
+      // A union atlas has ~200 glyphs: give frames a turn between batches.
+      if (i > 0 && i % glyphsPerSlice == 0) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      final code = charCodes[i];
+      metrics[code] = metricsExtractor.extractMetrics(code, cellSize, cellSize);
+    }
 
     final sdfRenderer = SdfRenderer(config, cellSize * config.renderScale);
 
@@ -158,7 +286,8 @@ class AtlasGenerator {
     final sdfTexture = sdfRenderer.renderToSDF(glyphs);
     textureProvider.addLoaded(sdfTexture, id.hashCode);
 
-    _stats.onBuilt(_describe(id), readback, stopwatch.elapsedMilliseconds);
+    _stats.onBuilt(_describe(id), readback, stopwatch.elapsedMilliseconds,
+        shared: _isUnion(id));
 
     return GlyphAtlas(
       atlasID: id,
@@ -175,7 +304,10 @@ class AtlasGenerator {
     );
   }
 
-  static String _describe(AtlasID id) => '${id.font}, ${id.chars.length} chars';
+  bool _isUnion(AtlasID id) => _unionByFont[id.font] == id;
+
+  String _describe(AtlasID id) => '${id.font}, ${id.chars.length} chars, '
+      '${_isUnion(id) ? 'union' : 'requested'}';
 }
 
 /// Configuration for atlas generation
@@ -339,7 +471,7 @@ class GlyphRenderer {
 
   Future<StampedRender<ui.Image>> _render(int renderFontSize) async {
     final nonce = GlyphStamp.next();
-    final (picture, width, height) = _record(renderFontSize, nonce);
+    final (picture, width, height) = await _record(renderFontSize, nonce);
     try {
       return StampedRender(await picture.toImage(width, height), nonce);
     } finally {
@@ -362,7 +494,7 @@ class GlyphRenderer {
 
   /// The glyph raster (white background, black glyphs), drawn inside a layer
   /// that stamps [nonce] into green and blue (see [GlyphStamp]).
-  (ui.Picture, int, int) _record(int renderFontSize, int nonce) {
+  Future<(ui.Picture, int, int)> _record(int renderFontSize, int nonce) async {
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
 
@@ -374,46 +506,53 @@ class GlyphRenderer {
     final bounds = Rect.fromPoints(Offset.zero, canvasSize);
 
     canvas.saveLayer(bounds, Paint()..colorFilter = GlyphStamp.filter(nonce));
-
-    canvas.drawRect(
-      bounds,
-      Paint()..color = Colors.white,
-    );
-
-    final charCodes = config.atlasID.chars.codeUnits;
-    for (int i = 0; i < charCodes.length; i++) {
-      final charCode = charCodes[i];
-      final col = i % config.gridCols;
-      final row = i ~/ config.gridCols;
-
-      final textPainter = TextPainter(
-        text: TextSpan(
-          text: String.fromCharCode(charCode),
-          style: TextStyle(
-            fontFamily: fontFamily.split("%").first,
-            fontStyle: ui.FontStyle.values
-                .firstWhere((it) => it.name == fontFamily.split("%").last),
-            fontSize: renderFontSize.toDouble(),
-            color: Colors.black,
-            fontWeight: FontWeight.w200,
-          ),
-        ),
-        textDirection: TextDirection.ltr,
+    try {
+      canvas.drawRect(
+        bounds,
+        Paint()..color = Colors.white,
       );
 
-      textPainter.layout();
+      final charCodes = config.atlasID.chars.codeUnits;
+      for (int i = 0; i < charCodes.length; i++) {
+        if (i > 0 && i % glyphsPerSlice == 0) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        final charCode = charCodes[i];
+        final col = i % config.gridCols;
+        final row = i ~/ config.gridCols;
 
-      final paddingLeft = (cellSize - textPainter.width) / 2;
-      final paddingTop = (cellSize - textPainter.height) / 2;
+        final textPainter = TextPainter(
+          text: TextSpan(
+            text: String.fromCharCode(charCode),
+            style: TextStyle(
+              fontFamily: fontFamily.split("%").first,
+              fontStyle: ui.FontStyle.values
+                  .firstWhere((it) => it.name == fontFamily.split("%").last),
+              fontSize: renderFontSize.toDouble(),
+              color: Colors.black,
+              fontWeight: FontWeight.w200,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        );
 
-      textPainter.paint(
-          canvas,
-          Offset(
-              paddingLeft + (col * cellSize), paddingTop + (row * cellSize)));
-      textPainter.dispose();
+        try {
+          textPainter.layout();
+
+          final paddingLeft = (cellSize - textPainter.width) / 2;
+          final paddingTop = (cellSize - textPainter.height) / 2;
+
+          textPainter.paint(
+              canvas,
+              Offset(paddingLeft + (col * cellSize),
+                  paddingTop + (row * cellSize)));
+        } finally {
+          textPainter.dispose();
+        }
+      }
+    } finally {
+      canvas.restore();
     }
-
-    canvas.restore();
 
     return (
       recorder.endRecording(),

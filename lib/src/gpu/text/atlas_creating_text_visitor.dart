@@ -39,8 +39,9 @@ class AtlasCreatingTextVisitor extends LayerVisitor {
 
       final filtered = charCodes.toList()..sort();
 
-      for (var i = 0; i < filtered.length; i += 256) {
-        final end = (i + 256 < filtered.length) ? i + 256 : filtered.length;
+      const chunk = AtlasGenerator.maxAtlasChars;
+      for (var i = 0; i < filtered.length; i += chunk) {
+        final end = (i + chunk < filtered.length) ? i + chunk : filtered.length;
         final charChunk = filtered.sublist(i, end);
         await atlasGenerator.loadAtlas(
             str: String.fromCharCodes(charChunk),

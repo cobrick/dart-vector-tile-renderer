@@ -12,6 +12,7 @@ import 'glyph_readback.dart';
 /// - the first atlas that needed a re-read gets one `log` line;
 /// - an atlas that needed a re-render, or hit a render error, gets a `warn`;
 /// - a withheld atlas gets a `warn`;
+/// - a shared (union) atlas build gets a `log` line;
 /// - a `log` summary follows every 50 built atlases.
 class GlyphAtlasStats {
   int built = 0;
@@ -22,7 +23,11 @@ class GlyphAtlasStats {
   bool _loggedFirstRetry = false;
 
   /// Records an atlas built from [readback] in [ms], described by [what].
-  void onBuilt(String what, ValidatedReadback readback, int ms) {
+  /// A [shared] (union) atlas is rare and reused by its font's tiles, so its
+  /// build gets a `log` line: otherwise a field log would show no atlas
+  /// activity at all.
+  void onBuilt(String what, ValidatedReadback readback, int ms,
+      {bool shared = false}) {
     built++;
     totalMs += ms;
     maxMs = math.max(maxMs, ms);
@@ -37,6 +42,9 @@ class GlyphAtlasStats {
       log(() => 'Glyph read-back retried, expected on some Vulkan GPUs '
           '(flutter/flutter#194987): $what; verdicts '
           '${readback.verdicts.join(',')}');
+    }
+    if (shared) {
+      log(() => 'Shared glyph atlas built: $what in $ms ms');
     }
     if (built % 50 == 0) {
       log(summary);

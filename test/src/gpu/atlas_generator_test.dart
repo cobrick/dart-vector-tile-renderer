@@ -48,12 +48,25 @@ void main() {
     AtlasGenerator.resetForTesting();
   });
 
-  AtlasGenerator generator(AtlasGeneratorFunction generate) => AtlasGenerator(
+  AtlasGenerator generator(
+    AtlasGeneratorFunction generate, {
+    String baseChars = '',
+    int baseSeedThreshold = 0,
+  }) =>
+      AtlasGenerator(
         atlasProvider: provider,
         textureProvider: TextureProvider(),
         generate: generate,
         nextFrame: () async {},
+        baseChars: baseChars,
+        baseSeedThreshold: baseSeedThreshold,
       );
+
+  String atlasCharsFor(String tileID, String char) => provider
+      .forTileID(tileID)
+      .getAtlasForChar(char.codeUnitAt(0), font)!
+      .atlasID
+      .chars;
 
   bool hasAtlas(String tileID) => !provider.forTileID(tileID).isEmpty;
 
@@ -150,6 +163,7 @@ void main() {
           throw StateError('frame failed');
         }
       },
+      baseChars: '',
     );
 
     await atlases.loadAtlas(str: 'ab', fontFamily: font, tileID: 't1');
@@ -176,6 +190,202 @@ void main() {
     await atlases.loadAtlas(str: 'cd', fontFamily: font, tileID: 't2');
 
     expect(hasAtlas('t2'), isTrue);
+  });
+
+  group('union atlases', () {
+    test(
+        'a new atlas holds the base set and every character seen for its '
+        'font, so later tiles reuse it', () async {
+      final built = <String>[];
+      final atlases = generator(
+        (id) async {
+          built.add(id.chars);
+          return _atlas(id);
+        },
+        baseChars: 'xyz',
+      );
+
+      await atlases.loadAtlas(str: 'ab', fontFamily: font, tileID: 't1');
+      await atlases.loadAtlas(str: 'by', fontFamily: font, tileID: 't2');
+      await atlases.loadAtlas(str: 'ac', fontFamily: font, tileID: 't3');
+
+      expect(built, ['abxyz', 'abcxyz']);
+      expect(hasAtlas('t2'), isTrue);
+    });
+
+    test('each font keeps its own characters', () async {
+      final built = <String>[];
+      final atlases = generator(
+        (id) async {
+          built.add('${id.font}:${id.chars}');
+          return _atlas(id);
+        },
+        baseChars: 'z',
+      );
+
+      await atlases.loadAtlas(str: 'ab', fontFamily: 'A%normal', tileID: 't1');
+      await atlases.loadAtlas(str: 'c', fontFamily: 'B%normal', tileID: 't2');
+
+      expect(built, ['A%normal:abz', 'B%normal:cz']);
+    });
+
+    test(
+        'past ${AtlasGenerator.maxAtlasChars} characters a new atlas holds '
+        'only the requested ones', () async {
+      final built = <String>[];
+      final atlases = generator(
+        (id) async {
+          built.add(id.chars);
+          return _atlas(id);
+        },
+        baseChars: String.fromCharCodes(List.generate(250, (i) => 0x400 + i)),
+      );
+
+      await atlases.loadAtlas(str: 'abcdefg', fontFamily: font, tileID: 't1');
+
+      expect(built, ['abcdefg']);
+    });
+
+    test(
+        'a tile covered by several atlases gets the largest completed one, '
+        'and older unions age out with their tiles', () async {
+      final built = <String>[];
+      final atlases = generator(
+        (id) async {
+          built.add(id.chars);
+          return _atlas(id);
+        },
+        baseChars: 'xyz',
+      );
+
+      await atlases.loadAtlas(str: 'a', fontFamily: font, tileID: 't1');
+      await atlases.loadAtlas(str: 'b', fontFamily: font, tileID: 't2');
+      await atlases.loadAtlas(str: 'x', fontFamily: font, tileID: 't3');
+      expect(built, ['axyz', 'abxyz']);
+      expect(atlasCharsFor('t3', 'x'), 'abxyz');
+
+      atlases.unloadWhereNotFound({'t2', 't3'});
+      await atlases.loadAtlas(str: 'b', fontFamily: font, tileID: 't4');
+      expect(built, ['axyz', 'abxyz']);
+      expect(atlasCharsFor('t4', 'b'), 'abxyz');
+    });
+
+    test('concurrent misses for one font cost two builds, not one per tile',
+        () async {
+      final built = <String>[];
+      final release = Completer<void>();
+      final atlases = generator(
+        (id) async {
+          built.add(id.chars);
+          if (built.length == 1) {
+            await release.future;
+          }
+          return _atlas(id);
+        },
+        baseChars: 'xyz',
+      );
+
+      final requests = [
+        atlases.loadAtlas(str: 'ab', fontFamily: font, tileID: 't1'),
+        atlases.loadAtlas(str: 'c', fontFamily: font, tileID: 't2'),
+        atlases.loadAtlas(str: 'd', fontFamily: font, tileID: 't3'),
+      ];
+      await Future<void>.delayed(Duration.zero);
+      release.complete();
+      await Future.wait(requests);
+
+      expect(built, ['abxyz', 'abcdxyz']);
+      expect(atlasCharsFor('t2', 'c'), 'abcdxyz');
+      expect(atlasCharsFor('t3', 'd'), 'abcdxyz');
+    });
+
+    test(
+        'a union of exactly ${AtlasGenerator.maxAtlasChars} characters is '
+        'still built', () async {
+      final built = <String>[];
+      final atlases = generator(
+        (id) async {
+          built.add(id.chars);
+          return _atlas(id);
+        },
+        baseChars: String.fromCharCodes(List.generate(249, (i) => 0x400 + i)),
+      );
+
+      await atlases.loadAtlas(str: 'abcdefg', fontFamily: font, tileID: 't1');
+
+      expect(built.single.length, AtlasGenerator.maxAtlasChars);
+    });
+
+    test('past the cap a font stays on per-tile atlases and logs it once',
+        () async {
+      final built = <String>[];
+      final atlases = generator(
+        (id) async {
+          built.add(id.chars);
+          return _atlas(id);
+        },
+        baseChars: String.fromCharCodes(List.generate(250, (i) => 0x400 + i)),
+      );
+
+      await atlases.loadAtlas(str: 'abcdefg', fontFamily: font, tileID: 't1');
+      await atlases.loadAtlas(str: 'h', fontFamily: font, tileID: 't2');
+
+      expect(built, ['abcdefg', 'h']);
+      expect(
+        logger.logs.where((it) => it.contains('per-tile atlases')),
+        hasLength(1),
+      );
+    });
+
+    test('a font below the seed threshold keeps a small atlas', () async {
+      final built = <String>[];
+      final atlases = generator(
+        (id) async {
+          built.add(id.chars);
+          return _atlas(id);
+        },
+        baseChars: 'xyz',
+        baseSeedThreshold: 5,
+      );
+
+      await atlases.loadAtlas(str: 'A4', fontFamily: font, tileID: 't1');
+      await atlases.loadAtlas(str: 'S1', fontFamily: font, tileID: 't2');
+      await atlases.loadAtlas(str: 'D7', fontFamily: font, tileID: 't3');
+
+      expect(built, ['4A', '14AS', '147ADSxyz']);
+    });
+
+    test("a withheld union retries with the tile's own characters", () async {
+      final built = <String>[];
+      final atlases = generator(
+        (id) async {
+          built.add(id.chars);
+          return id.chars == 'ab' ? _atlas(id) : null;
+        },
+        baseChars: 'xyz',
+      );
+
+      await atlases.loadAtlas(str: 'ab', fontFamily: font, tileID: 't1');
+
+      expect(built, ['abxyz', 'ab']);
+      expect(atlasCharsFor('t1', 'a'), 'ab');
+    });
+
+    test(
+        'the default base set covers Polish, Czech, Danish and German, '
+        'within the cap', () {
+      const letters = 'ąćęłńóśźżĄĆĘŁŃÓŚŹŻ' // Polish
+          'áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ' // Czech
+          'æøåÆØÅ' // Danish
+          'äöüßÄÖÜ' // German
+          '0123456789 -.,()„”«»·\u00A0'; // digits and punctuation in labels
+      final base = AtlasGenerator.defaultBaseChars;
+      for (final char in letters.split('')) {
+        expect(base, contains(char), reason: 'missing $char');
+      }
+      expect(base.length, 214);
+      expect(base.length, lessThanOrEqualTo(AtlasGenerator.maxAtlasChars));
+    });
   });
 }
 

@@ -58,16 +58,54 @@ distance range or dropping glyph data.
 
 ## Current Uncommitted Smoothing Work
 
-### Render only required glyphs
+### Union glyph atlases per font (AMPS-3116)
 
-`AtlasCreatingTextVisitor` no longer creates a default atlas containing all
-256 low character codes whenever a tile uses ordinary text. It now builds
-atlases only from the characters present in the tile, still chunking at 256
-characters when required.
+History: an early version built a default atlas of all 256 low character
+codes whenever a tile used text. It was replaced with atlases built from only
+the characters in each tile (typically 54–65 glyphs). But a tile reused an
+atlas only when the atlas held **all** of its characters, so panning kept
+building atlases. The Silesia atlases drew ~400 glyphs for 74 distinct
+characters.
 
-This removes the frequent 16x16-cell initial atlas. In profile logs, typical
-atlases are now based on the actual tile content, for example 54 or 65 glyphs.
-All required labels are still generated; the work is smaller, not omitted.
+Now `AtlasGenerator` builds **union atlases**. A new atlas for a font holds:
+- every character already seen for that font, plus the tile's characters;
+- a Latin base set (`defaultBaseChars`, 214 characters: ASCII, Latin-1
+  letters, common punctuation, and the Central European letters of Latin
+  Extended-A), once the font has needed `defaultBaseSeedThreshold` (32)
+  distinct characters.
+
+The main label font reaches the threshold on its first tile. Fonts that serve
+one small layer (motorway refs, water names) keep small atlases.
+
+- **Reuse:** a request takes the completed covering atlas with the most
+  characters, so tiles converge on the newest union and older ones age out.
+- **Concurrent misses:** while a union is in flight, a miss records its
+  characters and waits. The next union then covers every tile that waited,
+  so concurrent misses cost one extra build, not one per tile.
+- **Cap:** past `maxAtlasChars` (256, the visitor's chunk size, a 16×16 grid)
+  a font switches to per-tile atlases for the rest of the generator's life,
+  and logs it once.
+- **Withheld union:** if a union is withheld, the tile retries once with only
+  its own characters.
+- **Slicing:** glyph metrics and recording yield to the event loop every
+  `glyphsPerSlice` (32) glyphs, so a large atlas doesn't block the UI thread
+  in one piece.
+
+Measured on the same scripted 3.5-minute route, cold start, release builds of
+Tactical Commander, per-tile atlases vs union atlases (2026-11-04):
+
+| | Galaxy Tab Active5 (Mali-G68, Vulkan) | Getac ZX10 (Adreno 512, GLES) |
+| --- | --- | --- |
+| Atlases built while panning | 49 → 0 | 62 → 0 |
+| Atlas work while panning | 4.7 s → 0 | 8.3 s → 0 |
+| Atlases at startup | 11 → 2 | 10 → 2 |
+| First atlas at startup | 194 → 528 ms | 1.6 → 1.8 s (incl. shader compile) |
+| GPU memory after the route | 335.5 → 310.7 MB | 63.5 → 63.3 MB |
+
+Frame smoothness while panning was unchanged; map rendering dominates it.
+The trade-off is ~0.3 s more to the first labels after a cold start on the
+Galaxy Tab. A union holds ~7 MB of SDF texture per font
+(1408×1232 RGBA).
 
 ### Serialize atlas generation globally
 
@@ -135,8 +173,10 @@ The branch now operates as one GPU tile-rendering pipeline:
 
 1. The migrated Flutter GPU scene and shaders render map layers in the correct
    order, with correct transparency and text scale.
-2. For a new tile, the renderer identifies the characters used by that tile
-   and creates only the needed SDF glyph atlas.
+2. For a new tile, the renderer reuses its font's union atlas when that atlas
+   covers the tile's characters. Otherwise it builds one union atlas holding
+   every character seen for the font, plus the tile's characters and the
+   Latin base set (see "Union glyph atlases per font").
 3. Atlas jobs run one at a time across renderer instances, with a frame between
    jobs, rather than all incoming tiles competing for the GPU together.
 4. The completed tile geometry, materials, textures, and glyph atlas are
