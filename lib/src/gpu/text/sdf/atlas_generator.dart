@@ -5,19 +5,44 @@ import 'dart:math' as math;
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import '../../shaders.dart';
 import 'atlas_provider.dart';
+import 'glyph_atlas_stats.dart';
+import 'glyph_readback.dart';
+import 'glyph_stamp.dart';
 import 'sdf_renderer.dart';
 import '../../texture_provider.dart';
 import 'glyph_atlas_data.dart';
 
+/// Builds the glyph atlas for an [AtlasID], or returns `null` to withhold it.
+typedef AtlasGeneratorFunction = Future<GlyphAtlas?> Function(AtlasID id);
+
 class AtlasGenerator {
-  final _loading = <AtlasID, Completer<GlyphAtlas>>{};
+  final _loading = <AtlasID, Completer<GlyphAtlas?>>{};
   static Future<void> _generationTail = Future.value();
+  static final _stats = GlyphAtlasStats();
 
   final AtlasProvider atlasProvider;
   final TextureProvider textureProvider;
+  final AtlasGeneratorFunction? _generate;
+  final Future<void> Function() _nextFrame;
 
-  AtlasGenerator({required this.atlasProvider, required this.textureProvider});
+  AtlasGenerator({
+    required this.atlasProvider,
+    required this.textureProvider,
+    @visibleForTesting AtlasGeneratorFunction? generate,
+    @visibleForTesting Future<void> Function()? nextFrame,
+  })  : _generate = generate,
+        _nextFrame = nextFrame ?? _endOfFrame;
+
+  static Future<void> _endOfFrame() => SchedulerBinding.instance.endOfFrame;
+
+  /// Resets the process-wide generation state between tests.
+  @visibleForTesting
+  static void resetForTesting() {
+    _generationTail = Future.value();
+    _stats.reset();
+  }
 
   Future loadAtlas(
       {required String str,
@@ -30,6 +55,13 @@ class AtlasGenerator {
         ? await existingEntry.value.future
         : await _loadAtlas(AtlasID(chars: str, font: fontFamily));
 
+    // A withheld atlas was logged where it failed. Text layout drops every
+    // label of this tile that needs one of its characters, and the tile keeps
+    // that label-less render data until it leaves the tile cache. The next
+    // request for these characters generates the atlas again.
+    if (atlas == null) {
+      return;
+    }
     atlasProvider.addLoaded({atlas}, tileID);
   }
 
@@ -54,30 +86,50 @@ class AtlasGenerator {
     textureProvider.unloadWhereNotFound(neededTextureKeys);
   }
 
-  Future<GlyphAtlas> _loadAtlas(AtlasID id) {
+  Future<GlyphAtlas?> _loadAtlas(AtlasID id) {
     var atlas = _loading[id];
     if (atlas == null) {
-      atlas = Completer<GlyphAtlas>();
+      atlas = Completer<GlyphAtlas?>();
       _loading[id] = atlas;
       _enqueueGeneration(id, atlas);
     }
     return atlas.future;
   }
 
-  void _enqueueGeneration(AtlasID id, Completer<GlyphAtlas> completer) {
+  void _enqueueGeneration(AtlasID id, Completer<GlyphAtlas?> completer) {
     _generationTail = _generationTail.then((_) async {
+      GlyphAtlas? atlas;
       try {
-        completer.complete(await _generateBitmapAtlas(id, 24));
-      } catch (error, stackTrace) {
-        completer.completeError(error, stackTrace);
+        atlas = await (_generate ?? _generateDefault)(id);
+      } catch (error) {
+        _stats.onWithheld(_describe(id), error: error);
       }
+      if (atlas == null && identical(_loading[id], completer)) {
+        // Let the next request generate it again instead of reusing a miss.
+        _loading.remove(id);
+      }
+      completer.complete(atlas);
 
       // Keep one frame available for map gestures before starting the next atlas.
-      await SchedulerBinding.instance.endOfFrame;
+      await _nextFrame();
+    }).catchError((Object error) {
+      // Never let one failure stop every later atlas.
+      if (!completer.isCompleted) {
+        completer.complete(null);
+      }
+      GlyphAtlasStats.warn(() => 'Glyph atlas queue error: $error');
     });
   }
 
-  Future<GlyphAtlas> _generateBitmapAtlas(AtlasID id, int fontSize) async {
+  Future<GlyphAtlas?> _generateDefault(AtlasID id) =>
+      _generateBitmapAtlas(id, 24);
+
+  Future<GlyphAtlas?> _generateBitmapAtlas(AtlasID id, int fontSize) async {
+    // Tiles can pre-render before TilesRenderer.initialize has loaded the
+    // shaders. Idempotent.
+    await loadShaderLibrary();
+    final stopwatch = Stopwatch()..start();
+
     final config = AtlasConfig(atlasID: id);
 
     final metricsExtractor =
@@ -96,9 +148,17 @@ class AtlasGenerator {
 
     final sdfRenderer = SdfRenderer(config, cellSize * config.renderScale);
 
-    final glyphs = await glyphRenderer.renderGlyphs(renderFontSize);
+    final readback = await glyphRenderer.renderGlyphBytes(renderFontSize);
+    final glyphs = readback.bytes;
+    if (glyphs == null) {
+      _stats.onWithheld(_describe(id), readback: readback);
+      return null;
+    }
+
     final sdfTexture = sdfRenderer.renderToSDF(glyphs);
     textureProvider.addLoaded(sdfTexture, id.hashCode);
+
+    _stats.onBuilt(_describe(id), readback, stopwatch.elapsedMilliseconds);
 
     return GlyphAtlas(
       atlasID: id,
@@ -114,6 +174,8 @@ class AtlasGenerator {
       gridCols: config.gridCols,
     );
   }
+
+  static String _describe(AtlasID id) => '${id.font}, ${id.chars.length} chars';
 }
 
 /// Configuration for atlas generation
@@ -255,7 +317,52 @@ class GlyphRenderer {
 
   GlyphRenderer({required this.fontFamily, required this.config});
 
-  Future<Uint8List> renderGlyphs(int renderFontSize) async {
+  /// Renders the glyphs and reads them back as `rawRgba`, validated against
+  /// a per-render nonce (see [GlyphStamp]). The bytes are `null` when no read
+  /// validated within the attempt budget.
+  Future<ValidatedReadback> renderGlyphBytes(int renderFontSize) {
+    return readValidated<ui.Image>(
+      render: () => _render(renderFontSize),
+      read: _read,
+      dispose: (image) => image.dispose(),
+      wait: _waitForGpu,
+    );
+  }
+
+  /// A retry needs GPU time, not a UI frame, so this waits for whichever comes
+  /// first: the next frame or 32 ms. `endOfFrame` alone never completes while
+  /// the app is hidden.
+  static Future<void> _waitForGpu() => Future.any<void>([
+        SchedulerBinding.instance.endOfFrame,
+        Future<void>.delayed(const Duration(milliseconds: 32)),
+      ]);
+
+  Future<StampedRender<ui.Image>> _render(int renderFontSize) async {
+    final nonce = GlyphStamp.next();
+    final (picture, width, height) = _record(renderFontSize, nonce);
+    try {
+      return StampedRender(await picture.toImage(width, height), nonce);
+    } finally {
+      picture.dispose();
+    }
+  }
+
+  static Future<Uint8List> _read(ui.Image image) async {
+    final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (data == null) {
+      throw StateError('toByteData returned null');
+    }
+    final expected = image.width * image.height * 4;
+    if (data.lengthInBytes != expected) {
+      throw StateError(
+          'toByteData returned ${data.lengthInBytes} bytes, expected $expected');
+    }
+    return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+  }
+
+  /// The glyph raster (white background, black glyphs), drawn inside a layer
+  /// that stamps [nonce] into green and blue (see [GlyphStamp]).
+  (ui.Picture, int, int) _record(int renderFontSize, int nonce) {
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
 
@@ -264,9 +371,12 @@ class GlyphRenderer {
 
     final canvasSize =
         Offset(cellSize * config.gridCols, cellSize * config.gridRows);
+    final bounds = Rect.fromPoints(Offset.zero, canvasSize);
+
+    canvas.saveLayer(bounds, Paint()..colorFilter = GlyphStamp.filter(nonce));
 
     canvas.drawRect(
-      Rect.fromPoints(Offset.zero, canvasSize),
+      bounds,
       Paint()..color = Colors.white,
     );
 
@@ -300,26 +410,15 @@ class GlyphRenderer {
           canvas,
           Offset(
               paddingLeft + (col * cellSize), paddingTop + (row * cellSize)));
+      textPainter.dispose();
     }
 
-    // Convert to image
-    final picture = recorder.endRecording();
-    final image =
-        await picture.toImage(canvasSize.dx.toInt(), canvasSize.dy.toInt());
+    canvas.restore();
 
-    final result = await getBytes(image);
-
-    picture.dispose();
-    image.dispose();
-    return result;
-  }
-
-  Future<Uint8List> getBytes(ui.Image image) async {
-    final byteData = Uint8List(image.width * image.height * 4);
-    final decoded = (await image.toByteData(format: ui.ImageByteFormat.rawRgba))
-        ?.buffer
-        .asUint8List();
-
-    return decoded ?? byteData;
+    return (
+      recorder.endRecording(),
+      canvasSize.dx.toInt(),
+      canvasSize.dy.toInt()
+    );
   }
 }
