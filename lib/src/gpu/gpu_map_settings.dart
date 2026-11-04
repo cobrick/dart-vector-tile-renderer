@@ -1,3 +1,5 @@
+import '../logger.dart';
+
 /// Anti-aliasing quality for the flutter_gpu vector map.
 ///
 /// Higher quality means smoother edges but more GPU cost per frame. On slow
@@ -73,4 +75,16 @@ class GpuMapSettings {
   /// tiles stay uploaded in the scene (only [Node.visible] is toggled), so
   /// nothing pops — only their per-frame draw is skipped.
   static bool viewportCulling = true;
+
+  /// Where the renderer reports glyph-atlas diagnostics.
+  ///
+  /// - `warn`: an atlas that needed a re-render or hit a render error, an
+  ///   atlas withheld after failing, and a generation queue error.
+  /// - `log`: the first atlas that needed a re-read (expected on some Vulkan
+  ///   GPUs, flutter/flutter#194987) and a summary every 50 atlases.
+  ///
+  /// Silent by default. Set it once at startup to route these lines into
+  /// the app's own logging. Messages are built lazily, so a silent logger
+  /// costs nothing.
+  static Logger logger = const Logger.noop();
 }
