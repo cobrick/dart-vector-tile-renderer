@@ -94,6 +94,16 @@ void main() {
     expect(stats.withheld, 1);
   });
 
+  test('a shared atlas build is logged at debug level only', () {
+    stats.onBuilt('$what, union', _readback(['ok']), 120, shared: true);
+
+    expect(logger.warnings, isEmpty);
+    expect(
+      logger.logs.single,
+      'Shared glyph atlas built: $what, union in 120 ms',
+    );
+  });
+
   test('exactly one summary per 50 built atlases', () {
     for (var i = 0; i < 49; i++) {
       stats.onBuilt(what, _readback(['ok']), 10);
