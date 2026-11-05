@@ -35,6 +35,24 @@ the screen shows, because the canvas was already scaled to physical pixels.
 flutter_scene is still a dependency for raster tilesets
 (`gpuTextureFromImage`) only.
 
+### Measured (2026-11-05)
+
+Release builds of Tactical Commander (Galaxy Tab Active5 8", Mali-G68,
+Vulkan) and Base Station (Galaxy Tab Active5 Pro, Vulkan), both at
+120 Hz. The app drives the camera along the same scripted route (swipes at
+zoom 14, 16 and 11, a continuous pan at 13, zooms); only frames whose vsync
+falls while the camera moves count. Mean of two runs.
+
+| Build | 8" fps | 8" UI p50 | 8" frames > 16.7 ms | 8" GPU MB | Pro fps | Pro UI p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline (`e5f5b93`) | 44.9 | 18.9 ms | 86% | 313 | 64.4 | 12.9 ms |
+| Labels without FXAA (`9a25154`) | 49.0 | 17.2 ms | 69% | 286 | 69.2 | 11.8 ms |
+| Screen resolution (`4316971`) | 64.3 | 12.6 ms | 13% | 207 | 85.1 | 9.3 ms |
+| 2D render pass (this) | 97.2 | 5.0 ms | 4% | 156 | 101.6 | 4.6 ms |
+
+Diagnostics on the baseline showed the UI thread mostly waited for GPU work:
+at half resolution the 8" ran at 93 fps, with the labels layer off at 70.
+
 ## Committed Baseline
 
 The baseline is commit `1763352` (`feat: port GPU tile renderer to
