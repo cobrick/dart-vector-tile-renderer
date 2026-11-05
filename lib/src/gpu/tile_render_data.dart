@@ -5,12 +5,16 @@ import 'bucket_unpacker.dart';
 class TileRenderData {
   final List<PackedMesh> data = [];
 
+  /// Index of the style layer whose meshes are being added. Meshes record
+  /// it so that tiles can be drawn layer by layer.
+  int currentLayer = 0;
+
   void addMesh(PackedMesh mesh) {
-    data.add(mesh);
+    data.add(mesh..layer = currentLayer);
   }
 
   void addMeshes(Iterable<PackedMesh> meshes) {
-    data.addAll(meshes);
+    meshes.forEach(addMesh);
   }
 
   static TileRenderData unpack(Uint8List bytes) {
@@ -23,7 +27,7 @@ class TileRenderData {
 
     for (int i = 0; i < meshCount; i++) {
       final mesh = _readMesh(view, bytes, offset);
-      result.addMesh(mesh.mesh);
+      result.data.add(mesh.mesh);
       offset = mesh.nextOffset;
     }
 
@@ -48,7 +52,7 @@ class TileRenderData {
 
   static _MeshReadResult _readMesh(ByteData view, Uint8List bytes, int offset) {
     final header = _readMeshHeader(view, offset);
-    offset += 18;
+    offset += _meshHeaderLength;
 
     final meshData = _readMeshData(bytes, offset, header);
 
@@ -63,7 +67,7 @@ class TileRenderData {
         uniform: meshData.materialUniform,
         type: header.materialType,
       ),
-    );
+    )..layer = header.layer;
 
     return _MeshReadResult(mesh, meshData.nextOffset);
   }
@@ -76,8 +80,11 @@ class TileRenderData {
       indicesLength: view.getUint32(offset + 6, Endian.little),
       geometryUniformLength: view.getUint32(offset + 10, Endian.little),
       materialUniformLength: view.getUint32(offset + 14, Endian.little),
+      layer: view.getUint16(offset + 18, Endian.little),
     );
   }
+
+  static const _meshHeaderLength = 20;
 
   static _MeshData _readMeshData(
       Uint8List bytes, int offset, _MeshHeader header) {
@@ -123,14 +130,15 @@ class TileRenderData {
   }
 
   static void _writeMeshHeader(BytesBuilder builder, PackedMesh mesh) {
-    // Mesh Header (18 bytes total):
+    // Mesh Header (20 bytes total):
     //   - geometryType: uint8 (1 byte) at offset 0
     //   - materialType: uint8 (1 byte) at offset 1
     //   - verticesLength: uint32 (4 bytes) at offset 2
     //   - indicesLength: uint32 (4 bytes) at offset 6
     //   - geometryUniformLength: uint32 (4 bytes) at offset 10
     //   - materialUniformLength: uint32 (4 bytes) at offset 14
-    final meshHeaderBytes = Uint8List(18);
+    //   - layer: uint16 (2 bytes) at offset 18, the style layer index
+    final meshHeaderBytes = Uint8List(_meshHeaderLength);
     final meshHeaderView = ByteData.view(meshHeaderBytes.buffer);
 
     meshHeaderView.setUint8(0, mesh.geometry.type.index);
@@ -143,6 +151,7 @@ class TileRenderData {
         10, mesh.geometry.uniform?.lengthInBytes ?? 0, Endian.little);
     meshHeaderView.setUint32(
         14, mesh.material.uniform?.lengthInBytes ?? 0, Endian.little);
+    meshHeaderView.setUint16(18, mesh.layer, Endian.little);
 
     builder.add(meshHeaderBytes);
   }
@@ -180,6 +189,7 @@ class _MeshHeader {
   final int indicesLength;
   final int geometryUniformLength;
   final int materialUniformLength;
+  final int layer;
 
   _MeshHeader({
     required this.geometryType,
@@ -188,6 +198,7 @@ class _MeshHeader {
     required this.indicesLength,
     required this.geometryUniformLength,
     required this.materialUniformLength,
+    required this.layer,
   });
 }
 
@@ -205,6 +216,10 @@ class _MeshData {
 class PackedMesh {
   final PackedGeometry geometry;
   final PackedMaterial material;
+
+  /// Index of the style layer this mesh draws (set by
+  /// [TileRenderData.addMesh]).
+  int layer = 0;
 
   PackedMesh(this.geometry, this.material);
 }

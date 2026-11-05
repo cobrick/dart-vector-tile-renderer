@@ -291,5 +291,31 @@ void main() {
         expect(unpackedIndices[i], equals((i * 2) % 256));
       }
     });
+
+    test('records the current style layer of each mesh and keeps it', () {
+      PackedMesh mesh() => PackedMesh(
+            PackedGeometry(
+              vertices: ByteData(4),
+              indices: ByteData(0),
+              type: GeometryType.polygon,
+            ),
+            PackedMaterial(type: MaterialType.colored),
+          );
+      final data = TileRenderData()
+        ..currentLayer = 0
+        ..addMesh(mesh())
+        ..currentLayer = 7
+        ..addMeshes([mesh(), mesh()])
+        ..currentLayer = 300
+        ..addMesh(mesh());
+
+      expect(data.data.map((m) => m.layer), [0, 7, 7, 300]);
+
+      final unpacked = TileRenderData.unpack(data.pack());
+
+      expect(unpacked.data.map((m) => m.layer), [0, 7, 7, 300]);
+      expect(unpacked.data.map((m) => m.geometry.type),
+          everyElement(GeometryType.polygon));
+    });
   });
 }

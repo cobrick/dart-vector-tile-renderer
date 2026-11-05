@@ -1,72 +1,57 @@
 import 'dart:typed_data';
-import 'package:flutter_gpu/gpu.dart';
-import 'package:flutter_scene/scene.dart';
-import '../texture_provider.dart';
 
+import 'package:flutter_gpu/gpu.dart';
+
+import '../map_material.dart';
 import '../shaders.dart';
+import '../texture_provider.dart';
 import '../tile_render_data.dart';
 import '../utils.dart';
 
-class TextMaterial extends UnlitMaterial {
-  late SamplerOptions sampler;
-  late final ByteData uniform;
-  int? creationTimestamp;
-
-  TextMaterial(PackedMaterial packed, TextureProvider textureProvider) {
-    setFragmentShader(shaderLibrary['TextFragment']!);
-
+/// SDF text. The packed uniform starts with the glyph atlas texture id
+/// (8 bytes), followed by the `FragInfo` block.
+class TextMaterial extends MapMaterial {
+  TextMaterial(PackedMaterial packed, TextureProvider textureProvider)
+      : super(shaderLibrary['TextFragment']!) {
     final uniform = packed.uniform;
     if (uniform != null) {
-      this.uniform = ByteData.sublistView(uniform, 8);
-      final textureID = byteDataToInt(ByteData.sublistView(uniform, 0, 8));
-      final texture = textureProvider.get(textureID);
-
-      if (texture != null) {
-        baseColorTexture = texture;
-      }
+      _fragInfo = ByteData.sublistView(uniform, 8);
+      _texture = textureProvider
+          .get(byteDataToInt(ByteData.sublistView(uniform, 0, 8)));
     }
-
-    creationTimestamp = DateTime.now().millisecondsSinceEpoch;
-
-    sampler = SamplerOptions(
-      minFilter: MinMagFilter.linear,
-      magFilter: MinMagFilter.linear,
-      mipFilter: MipFilter.linear,
-      widthAddressMode: SamplerAddressMode.clampToEdge,
-      heightAddressMode: SamplerAddressMode.clampToEdge,
-    );
   }
 
+  static final _sampler = SamplerOptions(
+    minFilter: MinMagFilter.linear,
+    magFilter: MinMagFilter.linear,
+    mipFilter: MipFilter.linear,
+    widthAddressMode: SamplerAddressMode.clampToEdge,
+    heightAddressMode: SamplerAddressMode.clampToEdge,
+  );
+
+  ByteData? _fragInfo;
+  Texture? _texture;
+
+  /// Labels fade in from when their tile is built; the shader reads the age
+  /// from the `Age` uniform.
+  final int _createdAt = DateTime.now().millisecondsSinceEpoch;
+
+  late final UniformSlot _fragInfoSlot =
+      fragmentShader.getUniformSlot("FragInfo");
+  late final UniformSlot _ageSlot = fragmentShader.getUniformSlot("Age");
+  late final UniformSlot _sdfSlot = fragmentShader.getUniformSlot('sdf');
+
   @override
-  void bind(
-    RenderPass pass,
-    HostBuffer transientsBuffer,
-    Lighting lighting,
-  ) {
-    configureRenderPass(pass);
-    pass.setWindingOrder(WindingOrder.clockwise);
-    pass.setDepthCompareOperation(CompareFunction.always);
+  bool get isDrawable => _fragInfo != null && _texture != null;
 
-    pass.bindUniform(
-      fragmentShader.getUniformSlot("FragInfo"),
-      transientsBuffer.emplace(uniform),
-    );
-
-    creationTimestamp ??= DateTime.now().millisecondsSinceEpoch;
-
-    // Impeller GLES only supports float uniforms; shader declares
-    // `Age { float milliseconds; }` so we pass a Float32 here.
-    pass.bindUniform(
-      fragmentShader.getUniformSlot("Age"),
-      transientsBuffer.emplace(Float32List.fromList([
-        (DateTime.now().millisecondsSinceEpoch - creationTimestamp!).toDouble(),
-      ]).buffer.asByteData()),
-    );
-
-    pass.bindTexture(fragmentShader.getUniformSlot('sdf'), baseColorTexture,
-        sampler: sampler);
+  @override
+  void bind(RenderPass pass, HostBuffer host) {
+    pass.bindUniform(_fragInfoSlot, host.emplace(_fragInfo!));
+    // Impeller GLES only supports float uniforms; the shader declares
+    // `Age { float milliseconds; }`.
+    final age = (DateTime.now().millisecondsSinceEpoch - _createdAt).toDouble();
+    pass.bindUniform(_ageSlot,
+        host.emplace(ByteData.sublistView(Float32List.fromList([age]))));
+    pass.bindTexture(_sdfSlot, _texture!, sampler: _sampler);
   }
-
-  @override
-  bool isOpaque() => false;
 }

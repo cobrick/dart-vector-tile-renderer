@@ -53,8 +53,10 @@ class _PreRendererLayerVisitor extends LayerVisitor {
   }
 
   void visitAllFeatures(Theme theme) {
-    for (var layer in theme.layers) {
-      layer.accept(context, this);
+    final layers = theme.layers;
+    for (var i = 0; i < layers.length; i++) {
+      tileRenderData.currentLayer = i;
+      layers[i].accept(context, this);
     }
   }
 

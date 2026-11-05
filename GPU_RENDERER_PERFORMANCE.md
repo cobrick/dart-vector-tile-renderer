@@ -4,6 +4,37 @@ This file records the GPU renderer baseline and the follow-up work aimed at
 making pan and zoom smoother. It is intentionally separate from the regular
 package README so profiling decisions have one source of truth.
 
+## Current Pipeline: One 2D Render Pass (AMPS-3216)
+
+Each map layer (`TilesRenderer`: world, labels) draws its visible tiles with
+`MapRenderPass`, one Flutter GPU render pass per frame:
+
+- **Target**: an 8-bit RGBA texture from a ring of three (the GPU never draws
+  into a texture the compositor may still read), sized to the layer's area in
+  physical pixels. With anti-aliasing, the pass draws into a 4× multisampled
+  texture in transient (on-chip) memory and resolves into the target at the
+  end of the pass. `MapAntiAliasing.fxaa` and `auto` mean MSAA too; labels
+  default to none (`GpuMapSettings.labelAntiAliasing`), their SDF edges are
+  already smooth.
+- **Order**: meshes draw in style-layer order across all visible tiles
+  (`layerMajorOrder`), with straight-alpha blending and no depth buffer, so
+  each layer paints over the ones below it. Each packed mesh records its style
+  layer index (`PackedMesh.layer`) for this. Drawing layer by layer also keeps
+  geometry in a tile's buffer zone under the neighbouring tile's higher layers.
+- **Colours**: style colours are written as they are, with no tone mapping or
+  gamma, so the screen shows the style's values.
+- **Per frame**: one `FrameInfo` uniform per tile, pipelines cached per shader
+  pair, material and geometry uniforms emplaced in one host buffer.
+- **Composite**: `canvas.drawImageRect` of the target into the layer's area.
+
+It replaced flutter_scene's 3D pipeline, which per frame and per layer drew
+into a 16-bit HDR target with a depth buffer, ran a full-screen tone-mapping
+pass and (on FXAA profiles) a full-screen FXAA pass, and sorted opaque and
+translucent meshes. That pipeline also rendered pixelRatio² as many pixels as
+the screen shows, because the canvas was already scaled to physical pixels.
+flutter_scene is still a dependency for raster tilesets
+(`gpuTextureFromImage`) only.
+
 ## Committed Baseline
 
 The baseline is commit `1763352` (`feat: port GPU tile renderer to
@@ -31,6 +62,9 @@ Together with the smoothing work below, this commit provides the compatible,
 visually correct GPU-rendering base on which tile scheduling and reuse work.
 
 ### Frustum Culling Is Currently Unusable
+
+Obsolete since the 2D render pass: `GpuMapSettings.frustumCulling` has no
+effect, and `viewportCulling` skips off-screen tiles.
 
 Frustum culling has been tested on-device and must remain disabled
 (`GpuMapSettings.frustumCulling = false`). Enabling it produces a rectangle
@@ -66,11 +100,10 @@ Galaxy Tab Active5): buildings rgb(24, 24, 24) showed as 68 grey, major
 roads 85 as 146, and water rgba(90, 173, 255, 0.21) over black as
 (56, 91, 115) instead of (19, 36, 54).
 
-`TilesRenderer` now sets linear tone mapping (a clamp) and a colour-grading
-gamma of 1/2.2, which raises each channel to the power 2.2 and cancels the
-final encode. Every other grading setting stays at its identity default.
-Blending still happens on the style's sRGB values, like MapLibre and the
-canvas renderer.
+The first fix set linear tone mapping and a colour-grading gamma of 1/2.2,
+which cancelled the final encode. The 2D render pass (above) has no tone
+mapping or gamma at all. Blending happens on the style's sRGB values, like
+MapLibre and the canvas renderer.
 
 ## Current Uncommitted Smoothing Work
 

@@ -1,17 +1,15 @@
 import 'dart:typed_data';
 
 import 'package:flutter_gpu/gpu.dart';
-import 'package:vector_math/vector_math.dart';
 
 import '../shaders.dart';
 import '../tile_geometry.dart';
 import '../tile_render_data.dart';
 
 class LineGeometry extends TileGeometry {
-  late double lineWidth;
-  late int extent;
-  late List<double>? dashLengths;
   late final ByteData _uniform;
+  late final UniformSlot _lineGeometrySlot =
+      vertexShader.getUniformSlot('LineGeometry');
 
   LineGeometry(PackedGeometry packed) {
     setVertexShader(shaderLibrary["LineVertex"]!);
@@ -24,13 +22,8 @@ class LineGeometry extends TileGeometry {
   }
 
   @override
-  void bind(RenderPass pass, HostBuffer transientsBuffer,
-      Matrix4 modelTransform, Matrix4 cameraTransform, Vector3 cameraPosition) {
-    super.bind(pass, transientsBuffer, modelTransform, cameraTransform,
-        cameraPosition);
-
-    final lineGeometrySlot = vertexShader.getUniformSlot('LineGeometry');
-    final lineGeometryView = transientsBuffer.emplace(_uniform);
-    pass.bindUniform(lineGeometrySlot, lineGeometryView);
+  void bind(RenderPass pass, HostBuffer host, BufferView frameInfo) {
+    super.bind(pass, host, frameInfo);
+    pass.bindUniform(_lineGeometrySlot, host.emplace(_uniform));
   }
 }

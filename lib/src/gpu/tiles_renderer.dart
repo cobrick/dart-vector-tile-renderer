@@ -1,48 +1,23 @@
 import 'dart:async';
+import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/widgets.dart';
-import 'package:flutter_scene/scene.dart';
-import 'package:vector_math/vector_math.dart' show Vector3;
+import 'package:flutter_gpu/gpu.dart' as gpu;
+import 'package:vector_math/vector_math.dart' as vm;
 import 'text/sdf/atlas_generator.dart';
 import 'text/sdf/atlas_provider.dart';
 import 'texture_provider.dart';
 
 import '../../vector_tile_renderer.dart';
 import 'bucket_unpacker.dart';
-import 'orthographic_camera.dart';
+import 'map_render_pass.dart';
 import 'position_transform.dart';
 import 'shaders.dart';
 import 'text/atlas_creating_text_visitor.dart';
 import 'tile_prerenderer.dart';
 import 'tile_render_data.dart';
-
-AntiAliasingMode _sceneAntiAliasing(MapAntiAliasing aa) => switch (aa) {
-      MapAntiAliasing.none => AntiAliasingMode.none,
-      MapAntiAliasing.fxaa => AntiAliasingMode.fxaa,
-      MapAntiAliasing.msaa => AntiAliasingMode.msaa,
-      MapAntiAliasing.auto => AntiAliasingMode.auto,
-    };
-
-/// Lets the style's colours reach the screen unchanged.
-///
-/// Style colours are display (sRGB) values, and the map blends them in that
-/// space, as MapLibre and the canvas renderer do. flutter_scene treats its HDR
-/// target as linear light instead: the resolve pass tone-maps it (PBR Neutral
-/// by default) and then encodes it with a fixed `pow(1/2.2)`. That lifted
-/// every colour; dark-theme buildings, rgb(24, 24, 24), showed as
-/// rgb(68, 68, 68). Linear tone mapping only clamps, and a colour-grading
-/// gamma of 1/2.2 raises each channel to the power 2.2 first, so the two
-/// cancel. Every other grading setting keeps its identity default.
-void _passStyleColorsThrough(Scene scene) {
-  scene
-    ..toneMapping = ToneMappingMode.linear
-    ..exposure = 1.0;
-  scene.postProcess.colorGrading
-    ..enabled = true
-    ..gamma = Vector3.all(1 / 2.2);
-}
 
 /// Squared distance from point [p] to the nearest edge/corner of [r] (0 when
 /// [p] is inside [r]). Used for the viewport cull without a sqrt.
@@ -82,22 +57,24 @@ class TileUiModel {
       required this.renderData});
 }
 
-/// Experimental: renders tiles using flutter_gpu
+/// Renders tiles with Flutter GPU, in one 2D render pass per frame (see
+/// [MapRenderPass]).
 ///
-/// this class is stateful, designed to be reused for rendering a tile
-/// multiple times.
-///
+/// This class is stateful, designed to be reused for rendering tiles
+/// frame after frame.
 class TilesRenderer with WidgetsBindingObserver {
   static final Completer<void> _initializer = Completer<void>();
   static Future<void> initialize = _initializer.future;
 
   final _positionByKey = <String, Rect>{};
-  final _cachedNodes = <String, Node>{};
 
-  // The visible tile keys built into the scene by the last [update], and
-  // whether that update deferred any tile (upload budget). Used to skip the
-  // scene teardown/rebuild when the visible set has not changed.
-  Set<String> _lastTileKeys = const {};
+  // The tiles built by the last [update], in model order, and recently
+  // off-screen tiles kept for reuse (least recently used first).
+  var _activeByKey = <String, List<MapDraw>>{};
+  final _cachedByKey = <String, List<MapDraw>>{};
+
+  // Whether the last [update] held back a tile (upload budget). Used to skip
+  // the rebuild when the visible set has not changed.
   bool _lastUpdateDeferred = false;
 
   // Labels fade in over this long after their tile is built (the text
@@ -108,8 +85,8 @@ class TilesRenderer with WidgetsBindingObserver {
   final TextureProvider _textureProvider = TextureProvider();
   late final _atlasGenerator = AtlasGenerator(
       atlasProvider: _atlasProvider, textureProvider: _textureProvider);
+  final _renderPass = MapRenderPass();
   Theme theme;
-  Scene? _scene;
 
   TilesRenderer(this.theme) {
     // Listen for OS memory pressure so we can drop the off-screen GPU tile
@@ -118,13 +95,10 @@ class TilesRenderer with WidgetsBindingObserver {
     // memory is to drop every Dart reference and let the GC collect them.
     WidgetsBinding.instance.addObserver(this);
     if (!_initializer.isCompleted) {
-      // flutter_scene's base shader bundle and our tile shader bundle both load
-      // asynchronously (shader assets can't be read synchronously on any
-      // backend); geometry/material construction throws until both are ready.
-      Future.wait([
-        Scene.initializeStaticResources(),
-        loadShaderLibrary(),
-      ]).then((_) {
+      // The tile shader bundle loads asynchronously (shader assets can't be
+      // read synchronously on any backend); geometry/material construction
+      // throws until it is ready.
+      loadShaderLibrary().then((_) {
         if (!_initializer.isCompleted) {
           _initializer.complete();
         }
@@ -138,9 +112,16 @@ class TilesRenderer with WidgetsBindingObserver {
       theme.layers.isNotEmpty &&
       theme.layers.every((layer) => layer.type == ThemeLayerType.symbol);
 
-  MapAntiAliasing get _antiAliasing => _labelsOnly
-      ? GpuMapSettings.labelAntiAliasing
-      : GpuMapSettings.antiAliasing;
+  /// Whether to draw with 4× MSAA: any anti-aliasing mode other than
+  /// [MapAntiAliasing.none] (the 2D pass has no FXAA, so
+  /// [MapAntiAliasing.fxaa] gets MSAA too), when the GPU supports it.
+  bool get _msaa {
+    final mode = _labelsOnly
+        ? GpuMapSettings.labelAntiAliasing
+        : GpuMapSettings.antiAliasing;
+    return mode != MapAntiAliasing.none &&
+        gpu.gpuContext.doesSupportOffscreenMSAA;
+  }
 
   /// Whether the map must be updated and drawn again even if the camera and
   /// the tiles stay still: tiles held back by the upload budget are still
@@ -150,15 +131,6 @@ class TilesRenderer with WidgetsBindingObserver {
       (_labelsOnly &&
           _sinceLastBuild.isRunning &&
           _sinceLastBuild.elapsed < _labelFadeIn);
-
-  Scene get scene {
-    var scene = _scene;
-    if (scene == null) {
-      scene = _createScene();
-      _scene = scene;
-    }
-    return scene;
-  }
 
   Uint8List Function(Theme theme, double zoom, Tileset tileset, String tileID)
       getPreRenderer() {
@@ -178,21 +150,19 @@ class TilesRenderer with WidgetsBindingObserver {
 
   void update(double zoom, List<TileUiModel> models, Iterable<String> tileIDs) {
     if (GpuMapSettings.tileNodeCacheCapacity <= 0) {
-      _cachedNodes.clear();
+      _cachedByKey.clear();
     }
-    final scene = this.scene;
 
     // Fast path: the visible tile set is identical to the last update and that
-    // update built all of it (nothing deferred by the upload budget), so the
-    // scene graph already holds exactly these nodes. Only the tile positions
-    // change frame to frame while the map moves — refresh those and skip the
-    // teardown/rebuild, node caching, and atlas prune (the set is unchanged, so
-    // there is nothing to cache or unload). A set change or a pending deferral
-    // falls through to the full rebuild below.
-    if (!_lastUpdateDeferred && models.length == _lastTileKeys.length) {
+    // update built all of it (nothing deferred by the upload budget). Only the
+    // tile positions change frame to frame while the map moves — refresh
+    // those and skip the rebuild, caching, and atlas prune (the set is
+    // unchanged, so there is nothing to cache or unload). A set change or a
+    // pending deferral falls through to the full rebuild below.
+    if (!_lastUpdateDeferred && models.length == _activeByKey.length) {
       var sameSet = true;
       for (final model in models) {
-        if (!_lastTileKeys.contains(model.tileId.key())) {
+        if (!_activeByKey.containsKey(model.tileId.key())) {
           sameSet = false;
           break;
         }
@@ -205,19 +175,16 @@ class TilesRenderer with WidgetsBindingObserver {
       }
     }
 
-    final activeNodesByKey =
-        Map.fromEntries(scene.root.children.map((n) => MapEntry(n.name, n)));
-    scene.root.removeAll();
+    final previous = _activeByKey;
+    final active = <String, List<MapDraw>>{};
     _positionByKey.clear();
-    final currentTileKeys = <String>{};
     final uploadBudget = GpuMapSettings.maxTileUploadsPerUpdate;
     var newUploads = 0;
     var deferred = false;
     for (final model in models) {
       final key = model.tileId.key();
-      currentTileKeys.add(key);
-      var node = activeNodesByKey[key] ?? _cachedNodes.remove(key);
-      if (node == null) {
+      var draws = previous.remove(key) ?? _cachedByKey.remove(key);
+      if (draws == null) {
         // Brand-new tile: unpacking uploads its geometry to the GPU
         // synchronously. Cap uploads per update so a burst of new tiles (e.g. a
         // fast multi-level zoom) can't freeze the UI thread. Deferred tiles are
@@ -232,63 +199,59 @@ class TilesRenderer with WidgetsBindingObserver {
           throw Exception(
               "no render data for tile ${model.tileId}, did you call preRender?");
         }
-        node = Node(name: key);
-        BucketUnpacker(_textureProvider, model.rasterTileset)
-            .unpackOnto(node, TileRenderData.unpack(renderData));
+        draws = BucketUnpacker(_textureProvider, model.rasterTileset)
+            .unpack(TileRenderData.unpack(renderData));
         newUploads++;
         _sinceLastBuild
           ..reset()
           ..start();
       }
       _positionByKey[key] = model.position;
-      scene.add(node);
+      active[key] = draws;
     }
 
-    for (final entry in activeNodesByKey.entries) {
-      if (!currentTileKeys.contains(entry.key)) {
-        _cacheNode(entry.key, entry.value);
-      }
+    // Whatever is left of the previous set went off screen.
+    for (final entry in previous.entries) {
+      _cacheTile(entry.key, entry.value);
     }
 
-    _lastTileKeys = currentTileKeys;
+    _activeByKey = active;
     _lastUpdateDeferred = deferred;
 
     _atlasGenerator.unloadWhereNotFound({
       ...tileIDs,
-      ..._cachedNodes.keys,
+      ..._cachedByKey.keys,
     });
   }
 
-  void _cacheNode(String key, Node node) {
+  void _cacheTile(String key, List<MapDraw> draws) {
     final capacity = GpuMapSettings.tileNodeCacheCapacity;
     if (capacity <= 0) {
       return;
     }
-    _cachedNodes.remove(key);
-    _cachedNodes[key] = node;
-    while (_cachedNodes.length > capacity) {
-      _cachedNodes.remove(_cachedNodes.keys.first);
+    _cachedByKey.remove(key);
+    _cachedByKey[key] = draws;
+    while (_cachedByKey.length > capacity) {
+      _cachedByKey.remove(_cachedByKey.keys.first);
     }
   }
 
   void render(ui.Canvas canvas, ui.Size size, double rotation) {
-    final scene = this.scene;
-    // Read live so a change to GpuMapSettings takes effect next frame.
-    scene.antiAliasingMode = _sceneAntiAliasing(_antiAliasing);
-
     canvas.clipRect(Offset.zero & size);
 
-    // Apply device pixel ratio scaling
+    // Draw in physical pixels: one target pixel per screen pixel.
     final view = ui.PlatformDispatcher.instance.views.first;
     final pixelRatio = view.display.devicePixelRatio;
     canvas.scale(1 / pixelRatio);
+    final destination = ui.Offset.zero & canvas.getLocalClipBounds().size;
+    final width = destination.width.ceil();
+    final height = destination.height.ceil();
 
     // Draw-time viewport cull. The map rotates about the viewport centre, so a
     // tile whose nearest point is beyond the circle enclosing the viewport
     // (half the viewport diagonal, plus a safety margin) cannot be visible at
-    // any rotation. Culled tiles are only hidden (visible=false) — they stay
-    // uploaded in the scene, so nothing pops and only the per-frame draw is
-    // skipped.
+    // any rotation. Culled tiles stay uploaded, so nothing pops; only their
+    // draws are skipped this frame.
     final cull = GpuMapSettings.viewportCulling;
     final center = Offset(size.width / 2, size.height / 2);
     const cullMargin = 0.15;
@@ -297,50 +260,53 @@ class TilesRenderer with WidgetsBindingObserver {
         (1 + cullMargin) *
         (1 + cullMargin);
 
-    for (final node in scene.root.children) {
-      final position = _positionByKey[node.name];
-      if (position == null) {
+    final tiles = <TileFrame>[];
+    for (final entry in _activeByKey.entries) {
+      final position = _positionByKey[entry.key];
+      if (position == null ||
+          (cull &&
+              _distanceSquaredToRect(center, position) > cullRadiusSquared)) {
         continue;
       }
-      node.localTransform = tileTransformMatrix(position, size, rotation);
-      node.visible = !cull ||
-          _distanceSquaredToRect(center, position) <= cullRadiusSquared;
+      tiles.add(TileFrame(
+          entry.value, tileTransformMatrix(position, size, rotation)));
     }
-    // The canvas is already in physical pixels (scaled by 1 / pixelRatio
-    // above), so the scene renders at pixel ratio 1: one target pixel per
-    // screen pixel. flutter_scene otherwise multiplies by the device pixel
-    // ratio again and draws pixelRatio² as many pixels as the screen shows.
-    // The camera keeps one shader unit per screen pixel either way, so line
-    // widths and text sizes don't change.
-    scene.render(OrthographicCamera(1.0, rotation), canvas,
-        viewport: ui.Offset.zero & canvas.getLocalClipBounds().size,
-        pixelRatio: 1.0);
-  }
 
-  Scene _createScene() {
-    Scene scene = Scene();
-    scene.antiAliasingMode = _sceneAntiAliasing(_antiAliasing);
-    _passStyleColorsThrough(scene);
-    return scene;
+    // Maps clip space to target pixels. The shaders use it only to size lines
+    // and text (one unit per screen pixel); positions come from the tile
+    // transforms.
+    final camera = vm.Matrix4.identity()
+      ..scaleByDouble(width.toDouble(), height.toDouble(), 1.0, 1.0)
+      ..rotateZ(rotation * pi / 180);
+
+    _renderPass.render(
+      canvas,
+      destination,
+      width: width,
+      height: height,
+      tiles: tiles,
+      camera: camera,
+      msaa: _msaa,
+    );
   }
 
   @override
   void didHaveMemoryPressure() {
-    // The OS is under memory pressure. Drop the off-screen tile-node cache and
+    // The OS is under memory pressure. Drop the off-screen tile cache and
     // any glyph atlases/textures that aren't backing a currently visible tile,
     // so the GC can reclaim their GPU memory. Visible tiles keep their atlases;
     // revisited tiles simply re-render (progressive), rather than crashing the
     // GPU driver with an out-of-device-memory allocation.
-    _cachedNodes.clear();
+    _cachedByKey.clear();
     _atlasGenerator.unloadWhereNotFound(_positionByKey.keys.toSet());
   }
 
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _scene?.root.removeAll();
-    _scene = null;
-    _cachedNodes.clear();
+    _activeByKey = {};
+    _cachedByKey.clear();
     _positionByKey.clear();
+    _renderPass.dispose();
     // Release every retained glyph atlas and its GPU texture. Without this a
     // theme switch or layer teardown leaks a full set of GPU resources until
     // the whole renderer is garbage collected.
