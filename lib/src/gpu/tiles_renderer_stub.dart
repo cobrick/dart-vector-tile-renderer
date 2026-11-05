@@ -58,5 +58,7 @@ class TilesRenderer {
 
   void render(ui.Canvas canvas, ui.Size size, double rotation) {}
 
+  bool get needsAnotherFrame => false;
+
   void dispose() {}
 }
