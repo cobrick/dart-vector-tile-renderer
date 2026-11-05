@@ -13,10 +13,20 @@ import '../../themes/style.dart';
 /// objects per segment: garbage that, on the map's worker isolates, triggers
 /// collections of the heap they share with the UI isolate.
 class LineGeometryBuilder {
+  /// [expectedPoints], the number of points in the lines to build, sizes the
+  /// first buffers (a segment takes 32 vertex floats and 6 indices, a join
+  /// a few more); they still grow when it is too small. A sparse tile has
+  /// many small groups, and fixed 20 KB buffers for each were garbage too.
+  LineGeometryBuilder({int? expectedPoints})
+      : _vertices = Float32List(
+            expectedPoints == null ? 4096 : max(64, expectedPoints * 40)),
+        _indices = Uint32List(
+            expectedPoints == null ? 1024 : max(16, expectedPoints * 12));
+
   int indexOffset = 0;
-  Float32List _vertices = Float32List(4096);
+  Float32List _vertices;
   int _vertexCount = 0;
-  Uint32List _indices = Uint32List(1024);
+  Uint32List _indices;
   int _indexCount = 0;
   Float32List _cumulativeLengths = Float32List(0);
 

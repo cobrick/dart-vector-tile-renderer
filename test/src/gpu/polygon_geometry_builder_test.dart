@@ -43,6 +43,28 @@ void main() {
         reason: 'the index buffer must have grown past its first size');
   });
 
+  test('the expected point count only sizes the buffers, too small or not', () {
+    final polygons = [
+      for (var p = 0; p < 50; p++)
+        TilePolygon([
+          TileLine([
+            for (var i = 0; i < 12; i++)
+              TilePoint((p * 40 + 30 * cos(2 * pi * i / 12)).roundToDouble(),
+                  (p * 20 + 30 * sin(2 * pi * i / 12)).roundToDouble()),
+          ]),
+        ]),
+    ];
+    final (v, i) = PolygonGeometryBuilder().build(polygons);
+    for (final hint in [0, 7, 600, 100000]) {
+      final (hv, hi) =
+          PolygonGeometryBuilder(expectedPoints: hint).build(polygons);
+      expect(Uint8List.sublistView(hv), Uint8List.sublistView(v),
+          reason: 'hint $hint');
+      expect(Uint8List.sublistView(hi), Uint8List.sublistView(i),
+          reason: 'hint $hint');
+    }
+  });
+
   test('no polygons give empty buffers', () {
     final (vertices, indices) = PolygonGeometryBuilder().build([]);
 

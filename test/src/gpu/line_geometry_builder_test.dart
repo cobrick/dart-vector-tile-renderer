@@ -31,4 +31,24 @@ void main() {
     const firstJoin = (n - 1) * 32;
     expect(vertices.sublist(firstJoin, firstJoin + 2), [line[1].x, line[1].y]);
   });
+
+  test('the expected point count only sizes the buffers, too small or not', () {
+    final lines = [
+      for (var l = 0; l < 20; l++)
+        [
+          for (var i = 0; i < 40; i++)
+            TilePoint(i * 3.0 + l, (i * l) % 11 * 2.0)
+        ],
+    ];
+    Uint8List bytes(ByteData data) => Uint8List.sublistView(data);
+
+    final (v, i) =
+        LineGeometryBuilder().build(lines, LineCap.round, LineJoin.round);
+    for (final hint in [0, 10, 800, 100000]) {
+      final (hv, hi) = LineGeometryBuilder(expectedPoints: hint)
+          .build(lines, LineCap.round, LineJoin.round);
+      expect(bytes(hv), bytes(v), reason: 'hint $hint');
+      expect(bytes(hi), bytes(i), reason: 'hint $hint');
+    }
+  });
 }

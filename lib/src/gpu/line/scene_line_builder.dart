@@ -74,6 +74,7 @@ class SceneLineBuilder {
     featureGroups.forEach((paint, group) {
       _addMesh(
         group.lines,
+        group.size,
         paint.strokeWidth!,
         features.first.layer.extent,
         paint,
@@ -105,9 +106,10 @@ class SceneLineBuilder {
     return null;
   }
 
-  void _addMesh(List<List<TilePoint>> lines, double lineWidth, int extent,
-      PaintModel paint, List<double>? dashLengths) {
-    final (vertices, indices) = LineGeometryBuilder().build(
+  void _addMesh(List<List<TilePoint>> lines, int points, double lineWidth,
+      int extent, PaintModel paint, List<double>? dashLengths) {
+    final (vertices, indices) =
+        LineGeometryBuilder(expectedPoints: points).build(
       lines,
       paint.lineCap ?? LineCap.DEFAULT,
       paint.lineJoin ?? LineJoin.DEFAULT,

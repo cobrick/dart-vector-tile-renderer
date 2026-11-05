@@ -14,9 +14,18 @@ import '../../model/geometry_model.dart';
 /// garbage on the map's worker isolates, whose collections pause the UI
 /// thread too.
 class PolygonGeometryBuilder {
-  Float32List _vertices = Float32List(3072);
+  /// [expectedPoints], the number of ring points in the polygons to build,
+  /// sizes the first buffers (3 floats per point; about one triangle per
+  /// point); they still grow when it is too small.
+  PolygonGeometryBuilder({int? expectedPoints})
+      : _vertices = Float32List(
+            expectedPoints == null ? 3072 : max(16, expectedPoints * 3)),
+        _indices = Uint32List(
+            expectedPoints == null ? 3072 : max(16, expectedPoints * 3));
+
+  Float32List _vertices;
   int _vertexFloats = 0;
-  Uint32List _indices = Uint32List(3072);
+  Uint32List _indices;
   int _indexCount = 0;
   final _flat = <double>[];
   final _holeIndices = <int>[];
