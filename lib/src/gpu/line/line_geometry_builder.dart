@@ -6,16 +6,21 @@ import 'package:vector_math/vector_math.dart';
 import '../../model/geometry_model.dart';
 import '../../themes/style.dart';
 
+/// Builds the vertices and indices of a line mesh.
+///
+/// Vertices and indices are written straight into two growing typed buffers.
+/// Building them in a small list per segment, join and cap made several
+/// objects per segment: garbage that, on the map's worker isolates, triggers
+/// collections of the heap they share with the UI isolate.
 class LineGeometryBuilder {
   int indexOffset = 0;
-  final BytesBuilder _vertexBytesBuilder = BytesBuilder(copy: false);
-  final BytesBuilder _indexBytesBuilder = BytesBuilder(copy: false);
+  Float32List _vertices = Float32List(4096);
+  int _vertexCount = 0;
+  Uint32List _indices = Uint32List(1024);
+  int _indexCount = 0;
   Float32List _cumulativeLengths = Float32List(0);
 
   int startIndex = 0;
-
-  // Reusable list for building indices to avoid .map().toList() allocations
-  final List<int> _tempIndices = <int>[];
 
   // Reusable Vector2 objects for setupJoinsMiter to avoid allocations
   final Vector2 _v2Temp1 = Vector2.zero();
@@ -23,13 +28,28 @@ class LineGeometryBuilder {
   final Vector2 _v2Temp3 = Vector2.zero();
   final Vector2 _v2Temp4 = Vector2.zero();
 
-  _addVertices(Float32List vertices) {
-    _vertexBytesBuilder.add(vertices.buffer.asUint8List());
+  /// Reserves [count] vertex floats and returns the index of the first.
+  int _addVertices(int count) {
+    final start = _vertexCount;
+    final end = start + count;
+    if (end > _vertices.length) {
+      _vertices = Float32List(max(end, _vertices.length * 2))
+        ..setRange(0, start, _vertices);
+    }
+    _vertexCount = end;
+    return start;
   }
 
-  void _addIndices(List<int> indexList) {
-    final indexData = Uint32List.fromList(indexList);
-    _indexBytesBuilder.add(indexData.buffer.asUint8List());
+  /// Reserves [count] indices and returns the index of the first.
+  int _addIndices(int count) {
+    final start = _indexCount;
+    final end = start + count;
+    if (end > _indices.length) {
+      _indices = Uint32List(max(end, _indices.length * 2))
+        ..setRange(0, start, _indices);
+    }
+    _indexCount = end;
+    return start;
   }
 
   (ByteData, ByteData) build(
@@ -49,8 +69,8 @@ class LineGeometryBuilder {
     }
 
     return (
-      ByteData.sublistView(_vertexBytesBuilder.takeBytes()),
-      ByteData.sublistView(_indexBytesBuilder.takeBytes())
+      ByteData.sublistView(_vertices, 0, _vertexCount),
+      ByteData.sublistView(_indices, 0, _indexCount),
     );
   }
 
@@ -80,46 +100,50 @@ class LineGeometryBuilder {
               : 0.0) /
           32.0;
 
-      final vertices = Float32List(32);
-      vertices[0] = p1.x;
-      vertices[1] = p1.y;
-      vertices[2] = p0.x;
-      vertices[3] = p0.y;
-      vertices[4] = 1;
-      vertices[5] = 0;
-      vertices[6] = 0;
-      vertices[7] = cumulativeLength1;
-      vertices[8] = p0.x;
-      vertices[9] = p0.y;
-      vertices[10] = p1.x;
-      vertices[11] = p1.y;
-      vertices[12] = -1;
-      vertices[13] = 0;
-      vertices[14] = 0;
-      vertices[15] = cumulativeLength0;
-      vertices[16] = p0.x;
-      vertices[17] = p0.y;
-      vertices[18] = p1.x;
-      vertices[19] = p1.y;
-      vertices[20] = 1;
-      vertices[21] = 0;
-      vertices[22] = 0;
-      vertices[23] = cumulativeLength0;
-      vertices[24] = p1.x;
-      vertices[25] = p1.y;
-      vertices[26] = p0.x;
-      vertices[27] = p0.y;
-      vertices[28] = -1;
-      vertices[29] = 0;
-      vertices[30] = 0;
-      vertices[31] = cumulativeLength1;
-      _addVertices(vertices);
+      final o = _addVertices(32);
+      final vertices = _vertices;
+      vertices[o + 0] = p1.x;
+      vertices[o + 1] = p1.y;
+      vertices[o + 2] = p0.x;
+      vertices[o + 3] = p0.y;
+      vertices[o + 4] = 1;
+      vertices[o + 5] = 0;
+      vertices[o + 6] = 0;
+      vertices[o + 7] = cumulativeLength1;
+      vertices[o + 8] = p0.x;
+      vertices[o + 9] = p0.y;
+      vertices[o + 10] = p1.x;
+      vertices[o + 11] = p1.y;
+      vertices[o + 12] = -1;
+      vertices[o + 13] = 0;
+      vertices[o + 14] = 0;
+      vertices[o + 15] = cumulativeLength0;
+      vertices[o + 16] = p0.x;
+      vertices[o + 17] = p0.y;
+      vertices[o + 18] = p1.x;
+      vertices[o + 19] = p1.y;
+      vertices[o + 20] = 1;
+      vertices[o + 21] = 0;
+      vertices[o + 22] = 0;
+      vertices[o + 23] = cumulativeLength0;
+      vertices[o + 24] = p1.x;
+      vertices[o + 25] = p1.y;
+      vertices[o + 26] = p0.x;
+      vertices[o + 27] = p0.y;
+      vertices[o + 28] = -1;
+      vertices[o + 29] = 0;
+      vertices[o + 30] = 0;
+      vertices[o + 31] = cumulativeLength1;
 
-      // Use reusable list to avoid .map().toList() allocation
-      _tempIndices.clear();
       final base = (4 * i) + indexOffset;
-      _tempIndices.addAll([base, base + 1, base + 2, base + 2, base + 3, base]);
-      _addIndices(_tempIndices);
+      final x = _addIndices(6);
+      final indices = _indices;
+      indices[x + 0] = base;
+      indices[x + 1] = base + 1;
+      indices[x + 2] = base + 2;
+      indices[x + 3] = base + 2;
+      indices[x + 4] = base + 3;
+      indices[x + 5] = base;
     }
     startIndex += max(segmentCount * 4, 0);
   }
@@ -138,57 +162,55 @@ class LineGeometryBuilder {
     double endCumulativeLength =
         (_cumulativeLengths.isNotEmpty ? _cumulativeLengths.last : 0.0) / 32.0;
 
-    final vertices = Float32List(32);
-    vertices[0] = a.x;
-    vertices[1] = a.y;
-    vertices[2] = b.x;
-    vertices[3] = b.y;
-    vertices[4] = -1;
-    vertices[5] = -1;
-    vertices[6] = round;
-    vertices[7] = startCumulativeLength;
-    vertices[8] = a.x;
-    vertices[9] = a.y;
-    vertices[10] = b.x;
-    vertices[11] = b.y;
-    vertices[12] = 1;
-    vertices[13] = -1;
-    vertices[14] = round;
-    vertices[15] = startCumulativeLength;
-    vertices[16] = d.x;
-    vertices[17] = d.y;
-    vertices[18] = c.x;
-    vertices[19] = c.y;
-    vertices[20] = -1;
-    vertices[21] = -1;
-    vertices[22] = round;
-    vertices[23] = endCumulativeLength;
-    vertices[24] = d.x;
-    vertices[25] = d.y;
-    vertices[26] = c.x;
-    vertices[27] = c.y;
-    vertices[28] = 1;
-    vertices[29] = -1;
-    vertices[30] = round;
-    vertices[31] = endCumulativeLength;
-    _addVertices(vertices);
+    final o = _addVertices(32);
+    final vertices = _vertices;
+    vertices[o + 0] = a.x;
+    vertices[o + 1] = a.y;
+    vertices[o + 2] = b.x;
+    vertices[o + 3] = b.y;
+    vertices[o + 4] = -1;
+    vertices[o + 5] = -1;
+    vertices[o + 6] = round;
+    vertices[o + 7] = startCumulativeLength;
+    vertices[o + 8] = a.x;
+    vertices[o + 9] = a.y;
+    vertices[o + 10] = b.x;
+    vertices[o + 11] = b.y;
+    vertices[o + 12] = 1;
+    vertices[o + 13] = -1;
+    vertices[o + 14] = round;
+    vertices[o + 15] = startCumulativeLength;
+    vertices[o + 16] = d.x;
+    vertices[o + 17] = d.y;
+    vertices[o + 18] = c.x;
+    vertices[o + 19] = c.y;
+    vertices[o + 20] = -1;
+    vertices[o + 21] = -1;
+    vertices[o + 22] = round;
+    vertices[o + 23] = endCumulativeLength;
+    vertices[o + 24] = d.x;
+    vertices[o + 25] = d.y;
+    vertices[o + 26] = c.x;
+    vertices[o + 27] = c.y;
+    vertices[o + 28] = 1;
+    vertices[o + 29] = -1;
+    vertices[o + 30] = round;
+    vertices[o + 31] = endCumulativeLength;
 
-    _tempIndices.clear();
-    _tempIndices.addAll([
-      startIndex + indexOffset,
-      startIndex + 1 + indexOffset,
-      1 + indexOffset,
-      startIndex + 1 + indexOffset,
-      2 + indexOffset,
-      1 + indexOffset,
-      startIndex + 3 + indexOffset,
-      startIndex - 4 + indexOffset,
-      startIndex - 1 + indexOffset,
-      startIndex + 2 + indexOffset,
-      startIndex + 3 + indexOffset,
-      startIndex - 1 + indexOffset,
-    ]);
-    _addIndices(_tempIndices);
+    final x = _addIndices(12);
+    final indices = _indices;
+    indices[x + 0] = startIndex + indexOffset;
+    indices[x + 1] = startIndex + 1 + indexOffset;
+    indices[x + 2] = 1 + indexOffset;
+    indices[x + 3] = startIndex + 1 + indexOffset;
+    indices[x + 4] = 2 + indexOffset;
+    indices[x + 5] = 1 + indexOffset;
+    indices[x + 6] = startIndex + 3 + indexOffset;
+    indices[x + 7] = startIndex - 4 + indexOffset;
+    indices[x + 8] = startIndex - 1 + indexOffset;
+    indices[x + 9] = startIndex + 2 + indexOffset;
+    indices[x + 10] = startIndex + 3 + indexOffset;
+    indices[x + 11] = startIndex - 1 + indexOffset;
     startIndex += 4;
   }
 
@@ -215,24 +237,24 @@ class LineGeometryBuilder {
               : 0.0) /
           32.0;
 
-      final vertices = Float32List(16);
-      vertices[0] = p1.x;
-      vertices[1] = p1.y;
-      vertices[2] = p0.x;
-      vertices[3] = p0.y;
-      vertices[4] = -1;
-      vertices[5] = -1;
-      vertices[6] = 1;
-      vertices[7] = joinCumulativeLength;
-      vertices[8] = p1.x;
-      vertices[9] = p1.y;
-      vertices[10] = p0.x;
-      vertices[11] = p0.y;
-      vertices[12] = 1;
-      vertices[13] = -1;
-      vertices[14] = 1;
-      vertices[15] = joinCumulativeLength;
-      _addVertices(vertices);
+      final o = _addVertices(16);
+      final vertices = _vertices;
+      vertices[o + 0] = p1.x;
+      vertices[o + 1] = p1.y;
+      vertices[o + 2] = p0.x;
+      vertices[o + 3] = p0.y;
+      vertices[o + 4] = -1;
+      vertices[o + 5] = -1;
+      vertices[o + 6] = 1;
+      vertices[o + 7] = joinCumulativeLength;
+      vertices[o + 8] = p1.x;
+      vertices[o + 9] = p1.y;
+      vertices[o + 10] = p0.x;
+      vertices[o + 11] = p0.y;
+      vertices[o + 12] = 1;
+      vertices[o + 13] = -1;
+      vertices[o + 14] = 1;
+      vertices[o + 15] = joinCumulativeLength;
 
       int offset = i * 4;
 
@@ -241,17 +263,14 @@ class LineGeometryBuilder {
       int c = offset + 0;
       int d = offset + 3;
 
-      // Use reusable list to avoid .map().toList() allocation
-      _tempIndices.clear();
-      _tempIndices.addAll([
-        c + indexOffset,
-        d + indexOffset,
-        b + indexOffset,
-        b + indexOffset,
-        d + indexOffset,
-        a + indexOffset
-      ]);
-      _addIndices(_tempIndices);
+      final x = _addIndices(6);
+      final indices = _indices;
+      indices[x + 0] = c + indexOffset;
+      indices[x + 1] = d + indexOffset;
+      indices[x + 2] = b + indexOffset;
+      indices[x + 3] = b + indexOffset;
+      indices[x + 4] = d + indexOffset;
+      indices[x + 5] = a + indexOffset;
     }
     startIndex += max(2 * joinCount, 0);
   }
@@ -267,30 +286,27 @@ class LineGeometryBuilder {
               : 0.0) /
           32.0;
 
-      final vertices = Float32List(8);
-      vertices[0] = p.x;
-      vertices[1] = p.y;
-      vertices[2] = 0;
-      vertices[3] = 0;
-      vertices[4] = 0;
-      vertices[5] = 0;
-      vertices[6] = 0;
-      vertices[7] = joinCumulativeLength;
-      _addVertices(vertices);
+      final o = _addVertices(8);
+      final vertices = _vertices;
+      vertices[o + 0] = p.x;
+      vertices[o + 1] = p.y;
+      vertices[o + 2] = 0;
+      vertices[o + 3] = 0;
+      vertices[o + 4] = 0;
+      vertices[o + 5] = 0;
+      vertices[o + 6] = 0;
+      vertices[o + 7] = joinCumulativeLength;
 
       int offset = i * 4;
 
-      // Use reusable list to avoid .map().toList() allocation
-      _tempIndices.clear();
-      _tempIndices.addAll([
-        offset + 5 + indexOffset,
-        offset + indexOffset,
-        startIndex + i + indexOffset,
-        offset + 3 + indexOffset,
-        offset + 6 + indexOffset,
-        startIndex + i + indexOffset,
-      ]);
-      _addIndices(_tempIndices);
+      final x = _addIndices(6);
+      final indices = _indices;
+      indices[x + 0] = offset + 5 + indexOffset;
+      indices[x + 1] = offset + indexOffset;
+      indices[x + 2] = startIndex + i + indexOffset;
+      indices[x + 3] = offset + 3 + indexOffset;
+      indices[x + 4] = offset + 6 + indexOffset;
+      indices[x + 5] = startIndex + i + indexOffset;
     }
     startIndex += max(joinCount, 0);
   }
@@ -357,38 +373,35 @@ class LineGeometryBuilder {
               : 0.0) /
           32.0;
 
-      final vertices = Float32List(16);
-      vertices[0] = cX;
-      vertices[1] = cY;
-      vertices[2] = cX;
-      vertices[3] = cY + 1;
-      vertices[4] = outX;
-      vertices[5] = -outY;
-      vertices[6] = 0;
-      vertices[7] = joinCumulativeLength;
-      vertices[8] = _v2Temp3.x;
-      vertices[9] = _v2Temp3.y;
-      vertices[10] = _v2Temp3.x;
-      vertices[11] = _v2Temp3.y + 1;
-      vertices[12] = -outX;
-      vertices[13] = outY;
-      vertices[14] = 0;
-      vertices[15] = joinCumulativeLength;
-      _addVertices(vertices);
+      final o = _addVertices(16);
+      final vertices = _vertices;
+      vertices[o + 0] = cX;
+      vertices[o + 1] = cY;
+      vertices[o + 2] = cX;
+      vertices[o + 3] = cY + 1;
+      vertices[o + 4] = outX;
+      vertices[o + 5] = -outY;
+      vertices[o + 6] = 0;
+      vertices[o + 7] = joinCumulativeLength;
+      vertices[o + 8] = _v2Temp3.x;
+      vertices[o + 9] = _v2Temp3.y;
+      vertices[o + 10] = _v2Temp3.x;
+      vertices[o + 11] = _v2Temp3.y + 1;
+      vertices[o + 12] = -outX;
+      vertices[o + 13] = outY;
+      vertices[o + 14] = 0;
+      vertices[o + 15] = joinCumulativeLength;
 
       int offset = i * 4;
 
-      // Use reusable list to avoid .map().toList() allocation
-      _tempIndices.clear();
-      _tempIndices.addAll([
-        offset + 6 + indexOffset,
-        offset + 3 + indexOffset,
-        startIndex + (2 * i) + indexOffset,
-        offset + indexOffset,
-        offset + 5 + indexOffset,
-        startIndex + (2 * i) + 1 + indexOffset,
-      ]);
-      _addIndices(_tempIndices);
+      final x = _addIndices(6);
+      final indices = _indices;
+      indices[x + 0] = offset + 6 + indexOffset;
+      indices[x + 1] = offset + 3 + indexOffset;
+      indices[x + 2] = startIndex + (2 * i) + indexOffset;
+      indices[x + 3] = offset + indexOffset;
+      indices[x + 4] = offset + 5 + indexOffset;
+      indices[x + 5] = startIndex + (2 * i) + 1 + indexOffset;
     }
     startIndex += max(2 * joinCount, 0);
   }
