@@ -162,9 +162,74 @@ ready 56 → 36 ms (8" 50 → 28 ms). A single worst frame per run stays
 noisy (40–84 ms on the Pro, 40–58 ms on the 8"); most of those frames
 hold no tile work at all.
 
-What is left: the UI isolate's own per-frame allocations (about one
-scavenge a second) and old-generation collections, which the render data
-(0.3–1.4 MB per tile) drives.
+What is left after these: see the next section.
+
+## What the Remaining Slow Frames Are (AMPS-3216)
+
+The bench splits every UI frame (begin frame to the end of draw frame)
+into time on a CPU (the thread's CPU clock), time runnable but waiting for
+a core (schedstat's run delay) and the rest, blocked; and the map's own
+work into encoding the render passes, submitting them, compositing them and
+uploading new tiles. schedstat's CPU field is not usable for this: for a
+running thread it lags by up to a scheduler tick, which made ordinary
+frames look 1.4 ms blocked.
+
+On the Pro a typical moving frame is CPU-bound: 5.4 ms, of which 5.3 ms on
+a CPU and 0.2 ms blocked. The slow frames (about 55 per run over 16.7 ms)
+are 60% CPU, 10% waiting for a core and 30% blocked, with about 15 context
+switches each against 1.4 in an ordinary frame. The map's own work is about
+a third of their time (encode 1.2 ms per frame for both passes, submit
+0.5 ms, composite 0.1 ms, an upload now and then); the rest is the
+framework, the app's other layers and garbage collection.
+
+Three changes, each measured on its own against the build before it
+(interleaved, three runs on the Pro, two on the 8"):
+
+- `TileRenderData.pack` returned a view of a growing `BytesBuilder`'s
+  power-of-two buffer, and a typed-data view sent to another isolate takes
+  its whole backing buffer along: up to 2.3× each tile's render data
+  crossed from the worker and stayed in the UI isolate's heap. It now packs
+  one exact-size list.
+- Draws allocate nothing: uniforms that never change are uploaded once per
+  tile into one device buffer (`StaticUniform`) instead of copied into the
+  frame's host buffer at every draw; labels that have faded in share one
+  `Age` block; the layer-major order is walked, not built; each `MapDraw`
+  keeps its pipeline; `FrameInfo` goes through one scratch block.
+- `PolygonGeometryBuilder` writes into growing typed buffers and reuses
+  one coordinate list, and `NdcLabelSpace` tests overlaps without
+  allocating (no lists, points or projections per test, no candidate set
+  per query). Labels along a line try a box at many positions, so this
+  ran very often on the workers.
+
+| Change | Pro | 8" |
+| --- | --- | --- |
+| Render data packed exactly | PSS 449 → 388 MB, slow frames per run 56 → 48, UI p99 16.6 → 15.7 ms | PSS 451 → 401 MB, frame times unchanged |
+| Draws without allocations | fps 116.4 → 116.7, UI p50 5.7 → 5.5 ms, p90 7.8 → 7.4 ms, encode −13% | frames over 16.7 ms 2.2% → 1.6%, UI p50 5.9 → 5.4 ms, p99 19.9 → 18.5 ms |
+| Polygons and labels without garbage | fps 116.9 → 117.3, frames over 16.7 ms 0.7% → 0.6%, UI p90 6.2 → 5.8 ms, p99 15.1 → 13.8 ms | fps 112.4 → 113.0, frames over 16.7 ms 1.5% → 1.3%, UI p99 18.1 → 17.2 ms |
+
+| Pro, 203 s traced | Worker scavenges (count / pause) | UI frames over 16.7 ms | Over 33 ms | Longest UI frame |
+| --- | --- | --- | --- | --- |
+| Geometry decoded on first read (above) | 182 / 870 ms | 63 | 3 | 48.9 ms |
+| + render data exact, draws without allocations | 187 / 891 ms | 63 | 10 | 45.0 ms |
+| + polygons and labels without garbage | 144 / 767 ms | 51 | 2 | 40.7 ms |
+
+Tested, not kept: a cap on upload time per update (4 ms on top of the
+count cap). A tile takes 0.1–3 ms to upload (p90), so the cap rarely bit:
+no change in slow frames on either tablet, tiles ready up to 4 ms later.
+
+Fewer tile workers, an app setting (`VectorTileDeviceProfile` in
+apollo_uikit): 3 map + 1 label workers on the Galaxy tablets instead of
+4 + 2. Six busy workers competed with the UI thread for the four fast
+cores, and each one's collections pause it. Pro: frames over 16.7 ms
+0.8% → 0.6%, slow frames per run 44 → 34, slowest frame 41 → 36 ms, new
+tiles ready 38 → 33 ms (p50). 8": 1.8% → 1.4%, tiles ready 27 → 26 ms.
+The blank share during fast swipes at zoom 14 rose from about 0.9% to
+1.05% of the screen on the Pro.
+
+What is left: the UI isolate allocates mostly outside the map (the
+framework and the app's layers rebuilt on every camera move, about one
+scavenge a second), old-generation collections (about one every 2.8 s),
+and worker scavenges (144 per 203 s).
 
 ## Committed Baseline
 
