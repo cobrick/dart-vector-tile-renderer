@@ -23,7 +23,7 @@ class TileRenderData {
         ByteData.view(bytes.buffer, bytes.offsetInBytes, bytes.lengthInBytes);
 
     final meshCount = _readHeader(view);
-    int offset = 8;
+    int offset = _headerLength;
 
     for (int i = 0; i < meshCount; i++) {
       final mesh = _readMesh(view, bytes, offset);
@@ -34,16 +34,28 @@ class TileRenderData {
     return result;
   }
 
+  /// The meshes in one list of exactly their packed length.
+  ///
+  /// Exact on purpose: a list that views a larger buffer (as a growing
+  /// `BytesBuilder` returns) sends that whole buffer to the isolate that
+  /// receives it, and the spare bytes stay alive with the render data.
   Uint8List pack() {
-    final builder = BytesBuilder();
-
-    _writeHeader(builder, data.length);
-
+    var length = _headerLength;
     for (final mesh in data) {
-      _writeMesh(builder, mesh);
+      length += _meshHeaderLength + _meshDataLength(mesh);
     }
+    final bytes = Uint8List(length);
+    final view = ByteData.sublistView(bytes);
 
-    return builder.takeBytes();
+    // Header: the mesh count, then 4 reserved bytes (zero).
+    view.setUint32(0, data.length, Endian.little);
+    var offset = _headerLength;
+    for (final mesh in data) {
+      _writeMeshHeader(view, offset, mesh);
+      offset = _writeMeshData(bytes, offset + _meshHeaderLength, mesh);
+    }
+    assert(offset == length);
+    return bytes;
   }
 
   static int _readHeader(ByteData view) {
@@ -116,20 +128,15 @@ class TileRenderData {
     return ByteData.view(bytes.buffer, bytes.offsetInBytes + offset, length);
   }
 
-  static void _writeHeader(BytesBuilder builder, int meshCount) {
-    final headerBytes = Uint8List(8);
-    final headerView = ByteData.view(headerBytes.buffer);
-    headerView.setUint32(0, meshCount, Endian.little);
-    headerView.setUint32(4, 0, Endian.little); // reserved
-    builder.add(headerBytes);
-  }
+  static const _headerLength = 8;
 
-  static void _writeMesh(BytesBuilder builder, PackedMesh mesh) {
-    _writeMeshHeader(builder, mesh);
-    _writeMeshData(builder, mesh);
-  }
+  static int _meshDataLength(PackedMesh mesh) =>
+      mesh.geometry.vertices.lengthInBytes +
+      mesh.geometry.indices.lengthInBytes +
+      (mesh.geometry.uniform?.lengthInBytes ?? 0) +
+      (mesh.material.uniform?.lengthInBytes ?? 0);
 
-  static void _writeMeshHeader(BytesBuilder builder, PackedMesh mesh) {
+  static void _writeMeshHeader(ByteData view, int offset, PackedMesh mesh) {
     // Mesh Header (20 bytes total):
     //   - geometryType: uint8 (1 byte) at offset 0
     //   - materialType: uint8 (1 byte) at offset 1
@@ -138,40 +145,39 @@ class TileRenderData {
     //   - geometryUniformLength: uint32 (4 bytes) at offset 10
     //   - materialUniformLength: uint32 (4 bytes) at offset 14
     //   - layer: uint16 (2 bytes) at offset 18, the style layer index
-    final meshHeaderBytes = Uint8List(_meshHeaderLength);
-    final meshHeaderView = ByteData.view(meshHeaderBytes.buffer);
-
-    meshHeaderView.setUint8(0, mesh.geometry.type.index);
-    meshHeaderView.setUint8(1, mesh.material.type.index);
-    meshHeaderView.setUint32(
-        2, mesh.geometry.vertices.lengthInBytes, Endian.little);
-    meshHeaderView.setUint32(
-        6, mesh.geometry.indices.lengthInBytes, Endian.little);
-    meshHeaderView.setUint32(
-        10, mesh.geometry.uniform?.lengthInBytes ?? 0, Endian.little);
-    meshHeaderView.setUint32(
-        14, mesh.material.uniform?.lengthInBytes ?? 0, Endian.little);
-    meshHeaderView.setUint16(18, mesh.layer, Endian.little);
-
-    builder.add(meshHeaderBytes);
+    view
+      ..setUint8(offset, mesh.geometry.type.index)
+      ..setUint8(offset + 1, mesh.material.type.index)
+      ..setUint32(
+          offset + 2, mesh.geometry.vertices.lengthInBytes, Endian.little)
+      ..setUint32(
+          offset + 6, mesh.geometry.indices.lengthInBytes, Endian.little)
+      ..setUint32(
+          offset + 10, mesh.geometry.uniform?.lengthInBytes ?? 0, Endian.little)
+      ..setUint32(
+          offset + 14, mesh.material.uniform?.lengthInBytes ?? 0, Endian.little)
+      ..setUint16(offset + 18, mesh.layer, Endian.little);
   }
 
-  static void _writeMeshData(BytesBuilder builder, PackedMesh mesh) {
-    _writeByteData(builder, mesh.geometry.vertices);
-    _writeByteData(builder, mesh.geometry.indices);
-
-    if (mesh.geometry.uniform != null) {
-      _writeByteData(builder, mesh.geometry.uniform!);
+  /// Writes the mesh's data at [offset] and returns the offset after it.
+  static int _writeMeshData(Uint8List bytes, int offset, PackedMesh mesh) {
+    offset = _writeByteData(bytes, offset, mesh.geometry.vertices);
+    offset = _writeByteData(bytes, offset, mesh.geometry.indices);
+    final geometryUniform = mesh.geometry.uniform;
+    if (geometryUniform != null) {
+      offset = _writeByteData(bytes, offset, geometryUniform);
     }
-
-    if (mesh.material.uniform != null) {
-      _writeByteData(builder, mesh.material.uniform!);
+    final materialUniform = mesh.material.uniform;
+    if (materialUniform != null) {
+      offset = _writeByteData(bytes, offset, materialUniform);
     }
+    return offset;
   }
 
-  static void _writeByteData(BytesBuilder builder, ByteData data) {
-    builder
-        .add(data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes));
+  static int _writeByteData(Uint8List bytes, int offset, ByteData data) {
+    final end = offset + data.lengthInBytes;
+    bytes.setRange(offset, end, Uint8List.sublistView(data));
+    return end;
   }
 }
 

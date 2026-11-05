@@ -317,5 +317,64 @@ void main() {
       expect(unpacked.data.map((m) => m.geometry.type),
           everyElement(GeometryType.polygon));
     });
+
+    test('packs the documented layout, byte for byte', () {
+      ByteData bytes(List<int> values) =>
+          ByteData.sublistView(Uint8List.fromList(values));
+      final data = TileRenderData()
+        ..currentLayer = 258
+        ..addMesh(PackedMesh(
+          PackedGeometry(
+            vertices: bytes([10, 20]),
+            indices: bytes([30, 40]),
+            uniform: bytes([50, 60, 70]),
+            type: GeometryType.polygon,
+          ),
+          PackedMaterial(
+            uniform: bytes([80, 90, 100, 110]),
+            type: MaterialType.line,
+          ),
+        ))
+        ..addMesh(PackedMesh(
+          PackedGeometry(
+            vertices: bytes([1]),
+            indices: bytes([]),
+            type: GeometryType.text,
+          ),
+          PackedMaterial(type: MaterialType.text),
+        ));
+
+      expect(data.pack(), [
+        2, 0, 0, 0, 0, 0, 0, 0, // mesh count, reserved
+        // mesh 1: types, vertices, indices, uniforms lengths, layer
+        GeometryType.polygon.index, MaterialType.line.index,
+        2, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 2, 1,
+        10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110,
+        // mesh 2: no indices, no uniforms
+        GeometryType.text.index, MaterialType.text.index,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1,
+        1,
+      ]);
+    });
+
+    test(
+        'packs into a list of exactly its length, so sending it to another '
+        'isolate copies no spare buffer', () {
+      final data = TileRenderData()
+        ..addMesh(PackedMesh(
+          PackedGeometry(
+            vertices: ByteData(3000),
+            indices: ByteData(600),
+            type: GeometryType.polygon,
+          ),
+          PackedMaterial(type: MaterialType.colored),
+        ));
+
+      final packed = data.pack();
+
+      expect(packed.lengthInBytes, 8 + 20 + 3000 + 600);
+      expect(packed.offsetInBytes, 0);
+      expect(packed.buffer.lengthInBytes, packed.lengthInBytes);
+    });
   });
 }
