@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_scene/scene.dart';
+import 'package:vector_math/vector_math.dart' show Vector3;
 import 'text/sdf/atlas_generator.dart';
 import 'text/sdf/atlas_provider.dart';
 import 'texture_provider.dart';
@@ -23,6 +24,25 @@ AntiAliasingMode _sceneAntiAliasing(MapAntiAliasing aa) => switch (aa) {
       MapAntiAliasing.msaa => AntiAliasingMode.msaa,
       MapAntiAliasing.auto => AntiAliasingMode.auto,
     };
+
+/// Lets the style's colours reach the screen unchanged.
+///
+/// Style colours are display (sRGB) values, and the map blends them in that
+/// space, as MapLibre and the canvas renderer do. flutter_scene treats its HDR
+/// target as linear light instead: the resolve pass tone-maps it (PBR Neutral
+/// by default) and then encodes it with a fixed `pow(1/2.2)`. That lifted
+/// every colour; dark-theme buildings, rgb(24, 24, 24), showed as
+/// rgb(68, 68, 68). Linear tone mapping only clamps, and a colour-grading
+/// gamma of 1/2.2 raises each channel to the power 2.2 first, so the two
+/// cancel. Every other grading setting keeps its identity default.
+void _passStyleColorsThrough(Scene scene) {
+  scene
+    ..toneMapping = ToneMappingMode.linear
+    ..exposure = 1.0;
+  scene.postProcess.colorGrading
+    ..enabled = true
+    ..gamma = Vector3.all(1 / 2.2);
+}
 
 /// Squared distance from point [p] to the nearest edge/corner of [r] (0 when
 /// [p] is inside [r]). Used for the viewport cull without a sqrt.
@@ -266,6 +286,7 @@ class TilesRenderer with WidgetsBindingObserver {
   Scene _createScene() {
     Scene scene = Scene();
     scene.antiAliasingMode = _sceneAntiAliasing(GpuMapSettings.antiAliasing);
+    _passStyleColorsThrough(scene);
     return scene;
   }
 

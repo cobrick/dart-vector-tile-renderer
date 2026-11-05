@@ -56,6 +56,22 @@ even when the configured SDF radius had already been reached. Keep this
 change: it reduces unnecessary fragment work without changing the configured
 distance range or dropping glyph data.
 
+## Style Colours Pass Through Unchanged (AMPS-3216)
+
+flutter_scene renders into a linear HDR target, and its resolve pass
+tone-maps (PBR Neutral by default) and gamma-encodes with a fixed
+`pow(1/2.2)`. Map style colours are already display (sRGB) values, so the
+map came out lighter than its style. Measured on the dark theme (8"
+Galaxy Tab Active5): buildings rgb(24, 24, 24) showed as 68 grey, major
+roads 85 as 146, and water rgba(90, 173, 255, 0.21) over black as
+(56, 91, 115) instead of (19, 36, 54).
+
+`TilesRenderer` now sets linear tone mapping (a clamp) and a colour-grading
+gamma of 1/2.2, which raises each channel to the power 2.2 and cancels the
+final encode. Every other grading setting stays at its identity default.
+Blending still happens on the style's sRGB values, like MapLibre and the
+canvas renderer.
+
 ## Current Uncommitted Smoothing Work
 
 ### Union glyph atlases per font (AMPS-3116)
