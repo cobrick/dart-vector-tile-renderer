@@ -306,8 +306,15 @@ class TilesRenderer with WidgetsBindingObserver {
       node.visible = !cull ||
           _distanceSquaredToRect(center, position) <= cullRadiusSquared;
     }
-    scene.render(OrthographicCamera(pixelRatio, rotation), canvas,
-        viewport: ui.Offset.zero & canvas.getLocalClipBounds().size);
+    // The canvas is already in physical pixels (scaled by 1 / pixelRatio
+    // above), so the scene renders at pixel ratio 1: one target pixel per
+    // screen pixel. flutter_scene otherwise multiplies by the device pixel
+    // ratio again and draws pixelRatio² as many pixels as the screen shows.
+    // The camera keeps one shader unit per screen pixel either way, so line
+    // widths and text sizes don't change.
+    scene.render(OrthographicCamera(1.0, rotation), canvas,
+        viewport: ui.Offset.zero & canvas.getLocalClipBounds().size,
+        pixelRatio: 1.0);
   }
 
   Scene _createScene() {
