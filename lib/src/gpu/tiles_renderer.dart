@@ -99,6 +99,11 @@ class TilesRenderer with WidgetsBindingObserver {
   // scene teardown/rebuild when the visible set has not changed.
   Set<String> _lastTileKeys = const {};
   bool _lastUpdateDeferred = false;
+
+  // Labels fade in over this long after their tile is built (the text
+  // shader's `Age` uniform), plus a frame or two of margin.
+  static const _labelFadeIn = Duration(milliseconds: 550);
+  final _sinceLastBuild = Stopwatch();
   final AtlasProvider _atlasProvider = AtlasProvider();
   final TextureProvider _textureProvider = TextureProvider();
   late final _atlasGenerator = AtlasGenerator(
@@ -126,6 +131,25 @@ class TilesRenderer with WidgetsBindingObserver {
       });
     }
   }
+
+  /// Whether this renderer only draws labels (every theme layer is a symbol
+  /// layer). Such a renderer uses [GpuMapSettings.labelAntiAliasing].
+  bool get _labelsOnly =>
+      theme.layers.isNotEmpty &&
+      theme.layers.every((layer) => layer.type == ThemeLayerType.symbol);
+
+  MapAntiAliasing get _antiAliasing => _labelsOnly
+      ? GpuMapSettings.labelAntiAliasing
+      : GpuMapSettings.antiAliasing;
+
+  /// Whether the map must be updated and drawn again even if the camera and
+  /// the tiles stay still: tiles held back by the upload budget are still
+  /// waiting to be built, or labels of a recently built tile are fading in.
+  bool get needsAnotherFrame =>
+      _lastUpdateDeferred ||
+      (_labelsOnly &&
+          _sinceLastBuild.isRunning &&
+          _sinceLastBuild.elapsed < _labelFadeIn);
 
   Scene get scene {
     var scene = _scene;
@@ -212,6 +236,9 @@ class TilesRenderer with WidgetsBindingObserver {
         BucketUnpacker(_textureProvider, model.rasterTileset)
             .unpackOnto(node, TileRenderData.unpack(renderData));
         newUploads++;
+        _sinceLastBuild
+          ..reset()
+          ..start();
       }
       _positionByKey[key] = model.position;
       scene.add(node);
@@ -247,7 +274,7 @@ class TilesRenderer with WidgetsBindingObserver {
   void render(ui.Canvas canvas, ui.Size size, double rotation) {
     final scene = this.scene;
     // Read live so a change to GpuMapSettings takes effect next frame.
-    scene.antiAliasingMode = _sceneAntiAliasing(GpuMapSettings.antiAliasing);
+    scene.antiAliasingMode = _sceneAntiAliasing(_antiAliasing);
 
     canvas.clipRect(Offset.zero & size);
 
@@ -285,7 +312,7 @@ class TilesRenderer with WidgetsBindingObserver {
 
   Scene _createScene() {
     Scene scene = Scene();
-    scene.antiAliasingMode = _sceneAntiAliasing(GpuMapSettings.antiAliasing);
+    scene.antiAliasingMode = _sceneAntiAliasing(_antiAliasing);
     _passStyleColorsThrough(scene);
     return scene;
   }

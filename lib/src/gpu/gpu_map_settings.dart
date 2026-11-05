@@ -35,6 +35,12 @@ class GpuMapSettings {
   /// Anti-aliasing mode. Defaults to [MapAntiAliasing.msaa].
   static MapAntiAliasing antiAliasing = MapAntiAliasing.msaa;
 
+  /// Anti-aliasing mode of a renderer whose theme holds only symbol (label)
+  /// layers. Defaults to [MapAntiAliasing.none]: labels are SDF-shaded, so
+  /// their edges are already smooth, and FXAA would only cost a full-screen
+  /// pass (and blur the text slightly).
+  static MapAntiAliasing labelAntiAliasing = MapAntiAliasing.none;
+
   /// Number of recently off-screen GPU tile nodes to retain per renderer.
   ///
   /// Set to zero to disable reuse. Higher values make backtracking pans
