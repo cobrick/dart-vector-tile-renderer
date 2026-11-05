@@ -190,7 +190,7 @@ Three changes, each measured on its own against the build before it
   its whole backing buffer along: up to 2.3× each tile's render data
   crossed from the worker and stayed in the UI isolate's heap. It now packs
   one exact-size list.
-- Draws allocate nothing: uniforms that never change are uploaded once per
+- No allocations per draw: uniforms that never change are uploaded once per
   tile into one device buffer (`StaticUniform`) instead of copied into the
   frame's host buffer at every draw; labels that have faded in share one
   `Age` block; the layer-major order is walked, not built; each `MapDraw`
@@ -204,13 +204,13 @@ Three changes, each measured on its own against the build before it
 | Change | Pro | 8" |
 | --- | --- | --- |
 | Render data packed exactly | PSS 449 → 388 MB, slow frames per run 56 → 48, UI p99 16.6 → 15.7 ms | PSS 451 → 401 MB, frame times unchanged |
-| Draws without allocations | fps 116.4 → 116.7, UI p50 5.7 → 5.5 ms, p90 7.8 → 7.4 ms, encode −13% | frames over 16.7 ms 2.2% → 1.6%, UI p50 5.9 → 5.4 ms, p99 19.9 → 18.5 ms |
+| No allocations per draw | fps 116.4 → 116.7, UI p50 5.7 → 5.5 ms, p90 7.8 → 7.4 ms, encode −13% | frames over 16.7 ms 2.2% → 1.6%, UI p50 5.9 → 5.4 ms, p99 19.9 → 18.5 ms |
 | Polygons and labels without garbage | fps 116.9 → 117.3, frames over 16.7 ms 0.7% → 0.6%, UI p90 6.2 → 5.8 ms, p99 15.1 → 13.8 ms | fps 112.4 → 113.0, frames over 16.7 ms 1.5% → 1.3%, UI p99 18.1 → 17.2 ms |
 
 | Pro, 203 s traced | Worker scavenges (count / pause) | UI frames over 16.7 ms | Over 33 ms | Longest UI frame |
 | --- | --- | --- | --- | --- |
 | Geometry decoded on first read (above) | 182 / 870 ms | 63 | 3 | 48.9 ms |
-| + render data exact, draws without allocations | 187 / 891 ms | 63 | 10 | 45.0 ms |
+| + render data exact, no allocations per draw | 187 / 891 ms | 63 | 10 | 45.0 ms |
 | + polygons and labels without garbage | 144 / 767 ms | 51 | 2 | 40.7 ms |
 
 Tested, not kept: a cap on upload time per update (4 ms on top of the

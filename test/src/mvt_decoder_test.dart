@@ -176,6 +176,65 @@ void main() {
     expect(() => VectorTileReader().read(truncated), throwsA(isA<Exception>()));
   });
 
+  test(
+      'leaves singular scalars sent length-delimited to the reference '
+      'decoder, which reads them its own way', () {
+    Uint8List tile(
+            List<int> layerExtra, List<int> featureExtra, List<int> value) =>
+        Uint8List.fromList(_bytesField(3, [
+          ..._bytesField(1, 'roads'.codeUnits),
+          ..._bytesField(2, [
+            ..._bytesField(4, _packed([9, 2, 4])),
+            ...featureExtra,
+          ]),
+          ..._bytesField(4, value),
+          ...layerExtra,
+        ]));
+    final value = _bytesField(1, 'x'.codeUnits);
+    final extent = tile(_bytesField(5, _varint(2)), [], value);
+    final version = tile(_bytesField(15, _varint(2)), [], value);
+    final id = tile([], _bytesField(1, _varint(7)), value);
+    final type = tile([], _bytesField(3, _varint(2)), value);
+    final intValue = tile([], [], _bytesField(4, _varint(3)));
+    final boolValue = tile([], [], _bytesField(7, _varint(1)));
+
+    for (final bytes in [extent, version, id, type, intValue, boolValue]) {
+      expect(decodeMvt(bytes), isNull);
+      // The reader then does what the reference decoder does: the same
+      // tile, or the same failure.
+      VectorTile? reference;
+      try {
+        reference = VectorTile.fromBytes(bytes: bytes);
+      } on Exception {
+        reference = null;
+      }
+      if (reference == null) {
+        expect(() => VectorTileReader().read(bytes), throwsA(isA<Exception>()));
+      } else {
+        expectSameTile(VectorTileReader().read(bytes), reference);
+      }
+    }
+  });
+
+  test('a long unpacked geometry decodes as the reference does', () {
+    final feature = [
+      for (var i = 0; i < 5000; i++) ..._field(4, 0, _varint(i * 7)),
+      ..._bytesField(4, _packed([9, 2, 4])),
+      for (var i = 0; i < 300; i++) ..._field(2, 0, _varint(i % 2)),
+    ];
+    final bytes = Uint8List.fromList(_bytesField(3, [
+      ..._bytesField(1, 'roads'.codeUnits),
+      ..._bytesField(2, feature),
+      ..._bytesField(3, 'class'.codeUnits),
+      ..._bytesField(4, _bytesField(1, 'primary'.codeUnits)),
+    ]));
+
+    final tile = decodeMvt(bytes)!;
+
+    expectSameTile(tile, VectorTile.fromBytes(bytes: bytes));
+    expect(tile.layers.single.features.single.geometryList, isA<Uint32List>());
+  });
+
   test('properties are decoded as VectorTileFeature.decodeProperties does', () {
     final theme = ProvidedThemes.lightTheme(logger: testLogger);
     final reference = VectorTile.fromBytes(bytes: sample);

@@ -15,8 +15,12 @@ import 'package:vector_tile/vector_tile.dart';
 /// in exact-size typed lists, nothing is decoded twice, and layers missing
 /// from [layerNames] are skipped without being decoded at all.
 ///
-/// Returns null for data it leaves to the reference decoder: malformed tiles,
-/// and protobuf groups. Native only: it reads 64-bit varints into `int`.
+/// Returns null for data it leaves to the reference decoder: malformed
+/// input in the layers it decodes, protobuf groups, and singular scalar
+/// fields sent length-delimited (protobuf reads those in its own way). A
+/// layer it skips is not checked, so a tile whose only damage is in a
+/// skipped layer still decodes. Native only: it reads 64-bit varints into
+/// `int`.
 VectorTile? decodeMvt(Uint8List bytes, {Set<String>? layerNames}) {
   try {
     return _decodeTile(_Reader(bytes, 0, bytes.length), layerNames);
@@ -86,6 +90,8 @@ VectorTileLayer? _decodeLayer(_Reader layer, Set<String>? layerNames) {
         extent = layer.varint() & 0xffffffff;
       case (15, 0):
         version = layer.varint() & 0xffffffff;
+      case (5, 2) || (15, 2):
+        throw _malformed;
       default:
         layer.skip(wire);
     }
@@ -118,7 +124,7 @@ VectorTileFeature _decodeFeature(
       case (2, 2):
         tags = _concat(tags, r.packedUint32());
       case (2, 0):
-        tags = _concat(tags, Uint32List(1)..[0] = r.varint());
+        tags = _append(tags, r.varint());
       case (3, 0):
         // An unknown enum value is kept aside by protobuf: the type stays.
         final value = r.varint() & 0xffffffff;
@@ -128,16 +134,18 @@ VectorTileFeature _decodeFeature(
       case (4, 2):
         geometry = _concat(geometry, r.packedUint32());
       case (4, 0):
-        geometry = _concat(geometry, Uint32List(1)..[0] = r.varint());
+        geometry = _append(geometry, r.varint());
+      case (1, 2) || (3, 2):
+        throw _malformed;
       default:
         r.skip(wire);
     }
   }
   return VectorTileFeature(
     id: id,
-    tags: tags ?? _noInts,
+    tags: _exact(tags) ?? _noInts,
     type: type,
-    geometryList: geometry ?? _noInts,
+    geometryList: _exact(geometry) ?? _noInts,
     extent: extent,
     keys: keys,
     values: values,
@@ -169,6 +177,8 @@ VectorTileValue _decodeValue(_Reader r) {
         sint = _zigZag64(r.varint());
       case (7, 0):
         bool_ = (r.varint() & 0xffffffff) != 0;
+      case (2 || 3 || 4 || 5 || 6 || 7, 2):
+        throw _malformed;
       default:
         r.skip(wire);
     }
@@ -194,14 +204,36 @@ int _zigZag64(int value) {
   return v >> 1;
 }
 
+/// Appends a packed run of a repeated uint32 field. One run, the usual case,
+/// stays as it was read.
 List<int> _concat(List<int>? a, Uint32List b) {
   if (a == null) {
     return b;
+  }
+  if (a is! Uint32List) {
+    return a..addAll(b);
   }
   return Uint32List(a.length + b.length)
     ..setRange(0, a.length, a)
     ..setRange(a.length, a.length + b.length, b);
 }
+
+/// Appends one unpacked element of a repeated uint32 field. The field turns
+/// into a growable list, so a long unpacked field takes linear time;
+/// [_exact] makes it an exact-size list again.
+List<int> _append(List<int>? a, int value) {
+  final element = value & 0xffffffff;
+  if (a == null) {
+    return <int>[element];
+  }
+  if (a is Uint32List) {
+    return <int>[...a, element];
+  }
+  return a..add(element);
+}
+
+List<int>? _exact(List<int>? a) =>
+    a == null || a is Uint32List ? a : Uint32List.fromList(a);
 
 /// Reads protobuf wire format from [bytes] between [pos] and [end].
 class _Reader {
