@@ -15,7 +15,8 @@ import 'bucket_unpacker.dart';
 import 'map_render_pass.dart';
 import 'position_transform.dart';
 import 'shaders.dart';
-import 'text/atlas_creating_text_visitor.dart';
+import 'text/glyph_collector.dart';
+import 'text/sdf/glyph_atlas_data.dart';
 import 'text/text_material.dart';
 import 'tile_prerenderer.dart';
 import 'tile_render_data.dart';
@@ -56,6 +57,46 @@ class TileUiModel {
       required this.tileset,
       required this.rasterTileset,
       required this.renderData});
+}
+
+/// What laying out a tile needs from the UI isolate: the glyph atlases its
+/// labels may use and the display's pixel ratio. It is plain data, sent to
+/// the worker isolate that runs [TilesRenderer.preRender].
+class PreRenderInput {
+  PreRenderInput._(this._atlases, this._pixelRatio, this._generated);
+
+  @visibleForTesting
+  PreRenderInput.forTesting(AtlasSet atlases, {required bool generated})
+      : this._(atlases, 1.0, generated);
+
+  final AtlasSet _atlases;
+  final double _pixelRatio;
+
+  /// Whether [_atlases] were generated for this tile's glyphs. If not, the
+  /// tile is laid out only when they hold every glyph its labels need.
+  final bool _generated;
+}
+
+/// A tile laid out by [TilesRenderer.preRender]: its [renderData], or, if
+/// the atlases lacked glyphs its labels need, no data and those glyphs, for
+/// [TilesRenderer.loadGlyphs].
+class PreRenderOutput {
+  PreRenderOutput._(this.renderData, this._glyphs, this._fonts);
+
+  final Uint8List? renderData;
+
+  /// The glyphs the labels need, per font, when the atlases lacked some.
+  final Map<String, Set<int>> _glyphs;
+
+  /// The fonts the labels use, when laid out with atlases reused from other
+  /// tiles; null when the atlases were generated for this tile.
+  final Set<String>? _fonts;
+
+  @visibleForTesting
+  Map<String, Set<int>> get glyphs => _glyphs;
+
+  @visibleForTesting
+  Set<String>? get fonts => _fonts;
 }
 
 /// Renders tiles with Flutter GPU, in one 2D render pass per frame (see
@@ -131,21 +172,61 @@ class TilesRenderer with WidgetsBindingObserver {
       _lastUpdateDeferred ||
       (_sinceLabelsBuilt.isRunning && _sinceLabelsBuilt.elapsed < _labelFadeIn);
 
-  Uint8List Function(Theme theme, double zoom, Tileset tileset, String tileID)
-      getPreRenderer() {
-    final atlasProvider = _atlasProvider;
-    final view = ui.PlatformDispatcher.instance.views.first;
-    final pixelRatio = view.display.devicePixelRatio;
-    return (Theme theme, double zoom, Tileset tileset, String tileID) =>
-        TilePreRenderer().preRender(
-            theme, zoom, tileset, atlasProvider.forTileID(tileID), pixelRatio);
+  /// Lays out [tileset] at [zoom] into the render data that [update] takes.
+  ///
+  /// Pure Dart, meant for a worker isolate: the decoded tile never has to
+  /// cross to the UI isolate, where copying its object graph takes tens of
+  /// milliseconds. Unless [input]'s atlases were generated for this tile, a
+  /// tile whose labels need a glyph they lack comes back without render data;
+  /// pass it to [loadGlyphs] and lay the tile out again.
+  static PreRenderOutput preRender(
+      Theme theme, double zoom, Tileset tileset, PreRenderInput input) {
+    Set<String>? fonts;
+    if (!input._generated) {
+      final glyphs = collectGlyphs(theme, tileset, zoom);
+      if (!input._atlases.covers(glyphs)) {
+        return PreRenderOutput._(null, glyphs, null);
+      }
+      fonts = glyphs.keys.toSet();
+    }
+    final renderData = TilePreRenderer()
+        .preRender(theme, zoom, tileset, input._atlases, input._pixelRatio);
+    return PreRenderOutput._(renderData, const {}, fonts);
   }
 
-  Future preRenderUi(double zoom, Tileset tileset, String tileID) async {
-    final visitor = AtlasCreatingTextVisitor(_atlasGenerator, theme);
-    visitor.visitAllFeatures(tileset, zoom);
-    await visitor.finish(tileID);
+  /// The input for laying out tile [tileID] with the glyph atlases tiles
+  /// already use: each font's largest, which usually holds every glyph a
+  /// new tile needs. They stay loaded for the tile while it is laid out;
+  /// then [keepUsedAtlases] keeps only those its labels use.
+  PreRenderInput preRenderInput(String tileID) => PreRenderInput._(
+      AtlasSet(_atlasProvider.offer(tileID)), _pixelRatio, false);
+
+  /// Keeps loaded for tile [tileID], laid out as [output], only the atlases
+  /// of the fonts its labels use. Another font's atlas (several MB of GPU
+  /// memory) is then released once no tile needs it.
+  void keepUsedAtlases(PreRenderOutput output, String tileID) {
+    final fonts = output._fonts;
+    if (fonts != null) {
+      _atlasProvider.accept(tileID, fonts);
+    }
   }
+
+  /// Generates atlases for the glyphs that tile [tileID] missed in [missed]
+  /// and returns the input to lay the tile out again with them.
+  Future<PreRenderInput> loadGlyphs(
+      PreRenderOutput missed, String tileID) async {
+    // Swap the tile's atlases only once the new ones are loaded: until then
+    // its offer keeps the atlases it may reuse (and their textures) loaded.
+    final loaded = await _atlasGenerator.loadGlyphs(missed._glyphs, tileID);
+    _atlasProvider
+      ..unload(tileID)
+      ..addLoaded(loaded, tileID);
+    return PreRenderInput._(
+        _atlasProvider.forTileID(tileID), _pixelRatio, true);
+  }
+
+  static double get _pixelRatio =>
+      ui.PlatformDispatcher.instance.views.first.display.devicePixelRatio;
 
   void update(double zoom, List<TileUiModel> models, Iterable<String> tileIDs) {
     if (GpuMapSettings.tileNodeCacheCapacity <= 0) {

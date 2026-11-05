@@ -53,6 +53,52 @@ falls while the camera moves count. Mean of two runs.
 Diagnostics on the baseline showed the UI thread mostly waited for GPU work:
 at half resolution the 8" ran at 93 fps, with the labels layer off at 70.
 
+## Tiles Are Prepared in One Worker Job (AMPS-3216)
+
+With drawing cheap, the remaining hitches while panning came from moving
+decoded tiles between isolates. A worker decoded each tile and its `Tile`
+object graph came back to the UI isolate. The UI isolate walked every feature
+for the glyphs its labels need, then copied the decoded `Tileset` into the
+pre-render job. Copying that object graph blocked the UI thread for 17–47 ms
+(p90) and up to 105 ms per tile.
+
+Now one worker job prepares a tile from its encoded bytes
+(`TilesRenderer.preRender`, run by vector_map_tiles' `MapLayer`):
+
+- The job decodes the tile, collects the glyphs its labels need, and lays it
+  out. Only the render data comes back; the decoded tile never crosses
+  isolates.
+- Glyph atlases stay on the UI isolate. The job carries, as plain data, each
+  font's largest atlas among those tiles already use (`preRenderInput`).
+  When they hold every glyph, the tile is laid out in one pass; when not, the
+  job returns the glyphs, the UI isolate generates atlases (`loadGlyphs`) and
+  the tile is laid out again with them.
+- A tile keeps only the atlases of fonts its labels use
+  (`keepUsedAtlases`). Atlases offered to tiles still in flight stay loaded
+  for them but are never offered on, so a font's atlas is released once no
+  laid-out tile uses it.
+- Queued jobs of tiles that left the view are dropped before a worker runs
+  them.
+
+Measured on the same route and devices as above, three interleaved runs per
+build, mean (2026-11-05):
+
+| Build | 8" fps | 8" frames > 16.7 ms | 8" UI p99 | 8" tile latency p50 | Pro fps | Pro UI p99 | Pro tile latency p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Exact tile clip (`2fa00de`) | 97.2 | 3.6% | 23.6 ms | 82 ms | 102.0 | 23.4 ms | 86 ms |
+| One worker job (this) | 108.4 | 2.5% | 20.3 ms | 48 ms | 113.1 | 22.3 ms | 54 ms |
+
+Handing a tile to a worker now costs the UI thread 0.1–0.2 ms (p90) instead
+of 13–41 ms. GPU memory is unchanged. The Pro's single worst frame per run
+was longer (64 → 73 ms, mean of six runs) while frames over 33 ms stayed at
+0.3%.
+
+A tile is laid out at the camera zoom of the moment its preparation starts,
+as before. After a zoom animation that moment comes earlier now, so line
+widths in tiles loaded during the animation can differ by a fraction of a
+pixel from the previous build; shots taken at a settled zoom are
+pixel-identical.
+
 ## Committed Baseline
 
 The baseline is commit `1763352` (`feat: port GPU tile renderer to

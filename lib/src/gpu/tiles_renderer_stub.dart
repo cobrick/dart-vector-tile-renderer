@@ -37,6 +37,16 @@ class TileUiModel {
   });
 }
 
+class PreRenderInput {
+  PreRenderInput._();
+}
+
+class PreRenderOutput {
+  PreRenderOutput._(this.renderData);
+
+  final Uint8List? renderData;
+}
+
 class TilesRenderer {
   Theme theme;
 
@@ -44,14 +54,17 @@ class TilesRenderer {
 
   static Future<void> initialize = Future.value();
 
-  Uint8List Function(Theme theme, double zoom, Tileset tileset, String tileID)
-      getPreRenderer() {
-    return (Theme theme, double zoom, Tileset tileset, String tileID) =>
-        Uint8List(0);
-  }
+  static PreRenderOutput preRender(
+          Theme theme, double zoom, Tileset tileset, PreRenderInput input) =>
+      PreRenderOutput._(Uint8List(0));
 
-  Future<void> preRenderUi(
-      double zoom, Tileset tileset, String tileID) async {}
+  PreRenderInput preRenderInput(String tileID) => PreRenderInput._();
+
+  void keepUsedAtlases(PreRenderOutput output, String tileID) {}
+
+  Future<PreRenderInput> loadGlyphs(
+          PreRenderOutput missed, String tileID) async =>
+      PreRenderInput._();
 
   void update(
       double zoom, List<TileUiModel> models, Iterable<String> tileIDs) {}
