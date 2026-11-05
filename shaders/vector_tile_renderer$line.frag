@@ -15,7 +15,12 @@ in float cumulative_length;
 out vec4 frag_color;
 
 void main() {
-  if (abs(v_position.x) > 1.001 || abs(v_position.y) > 1.001) {
+  // Clip to the tile's own square: [-1, 1) on both axes. Tile data reaches
+  // slightly past the square, so a looser bound let neighbouring tiles blend
+  // translucent layers (water, woods) twice along every seam. Half-open
+  // bounds give each pixel on a shared edge to exactly one tile.
+  if (v_position.x < -1.0 || v_position.x >= 1.0 ||
+      v_position.y < -1.0 || v_position.y >= 1.0) {
     discard;
   }
 
