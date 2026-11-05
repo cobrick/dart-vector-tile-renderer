@@ -10,6 +10,7 @@ import 'package:vector_tile_renderer/src/gpu/tile_render_data.dart';
 import 'package:vector_tile_renderer/src/themes/light_theme.dart';
 import 'package:vector_tile_renderer/vector_tile_renderer.dart';
 
+import '../test_files.dart';
 import '../test_logger.dart';
 import '../test_tile.dart';
 
@@ -162,6 +163,38 @@ void main() {
       provider.addLoaded({_atlas(font, 'cd')}, 't1');
 
       expect(atlases, hasLength(1));
+    });
+  });
+
+  group('TileFactory.layerNamesAt', () {
+    test(
+        'decoding only those layers lays the tile out byte for byte as '
+        'decoding them all', () async {
+      final bytes = await readTestFile('sample_tile.pbf');
+      final factory = TileFactory(theme, testLogger);
+      Tileset decode(Set<String>? names) => Tileset({
+            'openmaptiles': factory
+                .create(VectorTileReader().read(bytes, layerNames: names)),
+          });
+
+      for (final zoom in [3.0, 8.5, 11.0, 13.2, 14.0, 15.7, 17.0]) {
+        final all = decode(null);
+        final input =
+            _input(_covering(collectGlyphs(theme, all, zoom)), generated: true);
+        final some = decode(factory.layerNamesAt(zoom));
+
+        expect(TilesRenderer.preRender(theme, zoom, some, input).renderData,
+            TilesRenderer.preRender(theme, zoom, all, input).renderData,
+            reason: 'zoom $zoom');
+      }
+    });
+
+    test('names only the layers a theme layer draws at the zoom', () {
+      final factory = TileFactory(theme, testLogger);
+
+      expect(factory.layerNamesAt(14), everyElement(isIn(factory.layerNames)));
+      expect(factory.layerNamesAt(2).length,
+          lessThan(factory.layerNamesAt(14).length));
     });
   });
 

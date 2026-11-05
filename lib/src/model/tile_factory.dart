@@ -22,6 +22,26 @@ class TileFactory {
         layers.map((e) => e.selector.layerSelector.layerNames()).flatSet();
   }
 
+  /// The source layers that a theme layer can draw at [zoom]: those of every
+  /// layer whose zoom range holds `zoom.truncate()`, as its selector checks
+  /// it when the tile is laid out. Decoding only these gives the same render
+  /// data at [zoom]; a labels theme, for one, skips the roads below zoom 15.
+  Set<String> layerNamesAt(double zoom) {
+    final z = zoom.truncate();
+    return {
+      for (final layer in theme.layers.whereType<DefaultLayer>())
+        if (_mayDraw(layer, z)) ...layer.selector.layerSelector.layerNames(),
+    };
+  }
+
+  // The selector's widest range, so a layer it may draw is never skipped.
+  static bool _mayDraw(DefaultLayer layer, int zoom) {
+    final selector = layer.selector.layerSelector;
+    final min = selector.minZoom();
+    final max = selector.maxZoom();
+    return (min == null || zoom >= min) && (max == null || zoom <= max);
+  }
+
   TileData createTileData(VectorTile tile) {
     return TileData(
         layers: tile.layers
@@ -70,11 +90,19 @@ class TileFactory {
     return null;
   }
 
+  /// The feature's properties, decoded straight from its tags into one map.
+  /// It equals `feature.decodeProperties()` with converted values (same
+  /// entries, same order, the same errors for broken tags) without building
+  /// and caching an intermediate map per feature.
   Map<String, dynamic> _decodeProperties(VectorTileFeature feature) {
-    final properties = feature.decodeProperties();
-    // properties.removeWhere((key, value) => !propertyNames.contains(key));
-    // feature.properties = null;
-    return properties.map((key, value) => MapEntry(key, _convertValue(value)));
+    final tags = feature.tags;
+    final keys = feature.keys!;
+    final values = feature.values!;
+    final properties = <String, dynamic>{};
+    for (var i = 0; i < tags.length; i += 2) {
+      properties[keys[tags[i]]] = _convertValue(values[tags[i + 1]]);
+    }
+    return properties;
   }
 
   _convertValue(VectorTileValue value) {

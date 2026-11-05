@@ -110,6 +110,52 @@ widths in tiles loaded during the animation can differ by a fraction of a
 pixel from the previous build; shots taken at a settled zoom are
 pixel-identical.
 
+## UI Freezes Come From Worker Garbage (AMPS-3216)
+
+A Dart VM timeline of a profile build on the Pro (GC, Dart and Embedder
+streams, the same route) showed what the longest UI frames are: the paint
+phase stretched to 25–60 ms while the UI thread was stopped for garbage
+collection. Every one of the 20 longest paint phases overlapped one to
+three scavenges run by worker isolates. The map's workers share their
+heap with the UI isolate, so each of their collections pauses the UI
+thread wherever it is. Over 203 s the workers ran 397 scavenges (2.3 s of
+pauses, up to 21 ms each).
+
+A CPU profile of the workers put a quarter of their time in the protobuf
+parse alone: `VectorTile.fromBytes` builds a protobuf message per feature,
+grows every geometry and tag list element by element, and then copies it
+all into `VectorTile` objects, for every layer in the tile. Two changes cut
+that garbage, with identical output:
+
+- `decodeMvt` (`mvt_decoder.dart`) reads the wire format straight into
+  `VectorTile`, with geometry and tags in exact-size typed lists, and skips
+  the layers it is not asked for without decoding them. Malformed tiles and
+  protobuf groups fall back to `VectorTile.fromBytes`, as does the web,
+  where ints are not 64-bit. `TileFactory` builds each feature's
+  properties in one map instead of two.
+- `TileFactory.layerNamesAt(zoom)`: only the source layers some theme layer
+  can draw at the tile's zoom are decoded. The labels theme uses the roads
+  only for one-way arrows from zoom 15 and house numbers from zoom 17, so
+  below that it no longer decodes the largest layer of the tile.
+
+| Pro, 203 s traced | Before | Decoder | + layers by zoom |
+| --- | --- | --- | --- |
+| Worker scavenges (count / pause) | 397 / 2,333 ms | 270 / 1,678 ms | 267 / 1,579 ms |
+| UI frames over 16.7 ms | 160 | 109 | 104 |
+| Longest UI frame | 62.6 ms | 58.7 ms | 54.3 ms |
+
+Release builds, three interleaved runs on the Pro (two on the 8"):
+fps 113.1 → 115.3 (8" 108.7 → 110.7), frames over 16.7 ms 1.8% → 1.2%
+(8" 2.5% → 1.9%), UI p99 22.5 → 18.9 ms, new tiles ready 56 → 42 ms
+(8" 50 → 42 ms). The 8"'s single worst frame per run went 44 → 56 ms in
+two runs each; those frames are mixed (uploads, a raster-bound one, ones
+with no tile work).
+
+What is left: the workers' other garbage (each tile's geometry decoded into
+point objects, line meshes built from small buffers), the UI isolate's own
+per-frame allocations (about one scavenge a second), and old-generation
+collections driven by the render data (0.3–1.4 MB per tile).
+
 ## Committed Baseline
 
 The baseline is commit `1763352` (`feat: port GPU tile renderer to
