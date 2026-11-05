@@ -124,8 +124,8 @@ pauses, up to 21 ms each).
 A CPU profile of the workers put a quarter of their time in the protobuf
 parse alone: `VectorTile.fromBytes` builds a protobuf message per feature,
 grows every geometry and tag list element by element, and then copies it
-all into `VectorTile` objects, for every layer in the tile. Two changes cut
-that garbage, with identical output:
+all into `VectorTile` objects, for every layer in the tile. Four changes cut
+that garbage, each with identical output:
 
 - `decodeMvt` (`mvt_decoder.dart`) reads the wire format straight into
   `VectorTile`, with geometry and tags in exact-size typed lists, and skips
@@ -137,24 +137,34 @@ that garbage, with identical output:
   can draw at the tile's zoom are decoded. The labels theme uses the roads
   only for one-way arrows from zoom 15 and house numbers from zoom 17, so
   below that it no longer decodes the largest layer of the tile.
+- `LineGeometryBuilder` writes every segment, join and cap straight into
+  growing typed vertex and index buffers. It used to make three lists per
+  segment and join them through a `BytesBuilder`, and `SceneLineBuilder`
+  copied every polygon ring to close it (now a view, `_ClosedRing`).
+- A feature's geometry is decoded when a theme layer first reads it
+  (`TileDataFeature.toTileFeature`): the features no layer's filter selects
+  are never turned into point objects. `TileFeature` keeps its canvas-only
+  paths in late fields instead of three `LazyValue` holders per feature.
 
-| Pro, 203 s traced | Before | Decoder | + layers by zoom |
+| Pro, 203 s traced | Worker scavenges (count / pause) | UI frames over 16.7 ms | Longest UI frame |
 | --- | --- | --- | --- |
-| Worker scavenges (count / pause) | 397 / 2,333 ms | 270 / 1,678 ms | 267 / 1,579 ms |
-| UI frames over 16.7 ms | 160 | 109 | 104 |
-| Longest UI frame | 62.6 ms | 58.7 ms | 54.3 ms |
+| Before | 397 / 2,333 ms | 160 | 62.6 ms |
+| Decoder | 270 / 1,678 ms | 109 | 58.7 ms |
+| + layers by zoom | 267 / 1,579 ms | 104 | 54.3 ms |
+| + line meshes in typed buffers | 211 / 1,232 ms | 80 | 41.3 ms |
+| + geometry decoded on first read | 182 / 870 ms | 63 | 48.9 ms |
 
-Release builds, three interleaved runs on the Pro (two on the 8"):
-fps 113.1 → 115.3 (8" 108.7 → 110.7), frames over 16.7 ms 1.8% → 1.2%
-(8" 2.5% → 1.9%), UI p99 22.5 → 18.9 ms, new tiles ready 56 → 42 ms
-(8" 50 → 42 ms). The 8"'s single worst frame per run went 44 → 56 ms in
-two runs each; those frames are mixed (uploads, a raster-bound one, ones
-with no tile work).
+Release builds, three interleaved runs per step on the Pro (two on the
+8"), from before the decoder to geometry decoded on first read: fps
+113.1 → 117.2 (8" 108.7 → 112.9), frames over 16.7 ms 1.8% → 0.7%
+(8" 2.5% → 1.1%), UI p99 22.5 → 14.6 ms (8" 20.8 → 16.8 ms), new tiles
+ready 56 → 36 ms (8" 50 → 28 ms). A single worst frame per run stays
+noisy (40–84 ms on the Pro, 40–58 ms on the 8"); most of those frames
+hold no tile work at all.
 
-What is left: the workers' other garbage (each tile's geometry decoded into
-point objects, line meshes built from small buffers), the UI isolate's own
-per-frame allocations (about one scavenge a second), and old-generation
-collections driven by the render data (0.3–1.4 MB per tile).
+What is left: the UI isolate's own per-frame allocations (about one
+scavenge a second) and old-generation collections, which the render data
+(0.3–1.4 MB per tile) drives.
 
 ## Committed Baseline
 
