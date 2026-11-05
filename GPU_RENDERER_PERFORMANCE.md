@@ -89,9 +89,20 @@ build, mean (2026-11-05):
 | One worker job (this) | 108.4 | 2.5% | 20.3 ms | 48 ms | 113.1 | 22.3 ms | 54 ms |
 
 Handing a tile to a worker now costs the UI thread 0.1–0.2 ms (p90) instead
-of 13–41 ms. GPU memory is unchanged. The Pro's single worst frame per run
-was longer (64 → 73 ms, mean of six runs) while frames over 33 ms stayed at
-0.3%.
+of 13–41 ms. GPU memory is unchanged; the app's PSS fell by 10–14 MB.
+
+The Pro's single worst frame per run was longer (64 → 73 ms, mean of six
+runs) while frames over 33 ms stayed at 0.3%. In both builds the Pro's
+longest frames are UI-thread pauses with no tile work in them (no upload,
+result, load or hand-off in the frame), unlike the 8", where the old
+glyph walk and hand-off filled them and they got shorter (61 → 47 ms).
+
+Where render data lives was tested and kept: returning it in a
+`TransferableTypedData` (outside the Dart heap, as before this change) cut
+the app's PSS by another ~50 MB on both tablets, but cost about 1% fps and
+part of the gain in frames over 16.7 ms (Pro 1.7% → 2.0%), and did not
+shorten the Pro's longest frames. The render data now arrives as a plain
+`Uint8List` copied into the shared heap by the worker.
 
 A tile is laid out at the camera zoom of the moment its preparation starts,
 as before. After a zoom animation that moment comes earlier now, so line
