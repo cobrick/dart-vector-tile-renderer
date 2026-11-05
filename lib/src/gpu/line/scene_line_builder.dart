@@ -1,6 +1,6 @@
+import 'dart:collection';
 import 'dart:typed_data';
 
-import 'package:collection/collection.dart';
 import '../color_extension.dart';
 import 'line_geometry_builder.dart';
 import '../tile_render_data.dart';
@@ -16,6 +16,34 @@ import '../bucket_unpacker.dart';
 class FeatureGroup {
   final List<List<TilePoint>> lines = [];
   int size = 0;
+}
+
+/// A polygon ring as a closed line: its points, then its first point again.
+/// A view: copying every ring to close it was garbage on the map's worker
+/// isolates, whose collections pause the UI thread too.
+class _ClosedRing extends ListBase<TilePoint> {
+  _ClosedRing(this._points) {
+    if (_points.isEmpty) {
+      // As `ring.points.first` threw before.
+      throw StateError('No element');
+    }
+  }
+
+  final List<TilePoint> _points;
+
+  @override
+  int get length => _points.length + 1;
+
+  @override
+  set length(int newLength) => throw UnsupportedError('A closed ring');
+
+  @override
+  TilePoint operator [](int index) =>
+      index == _points.length ? _points[0] : _points[index];
+
+  @override
+  void operator []=(int index, TilePoint value) =>
+      throw UnsupportedError('A closed ring');
 }
 
 class SceneLineBuilder {
@@ -46,6 +74,7 @@ class SceneLineBuilder {
     featureGroups.forEach((paint, group) {
       _addMesh(
         group.lines,
+        group.size,
         paint.strokeWidth!,
         features.first.layer.extent,
         paint,
@@ -66,13 +95,10 @@ class SceneLineBuilder {
       if (feature.feature.modelLines.isNotEmpty) {
         return (paint, feature.feature.modelLines.map((it) => it.points));
       } else if (feature.feature.modelPolygons.isNotEmpty) {
-        var outlines = feature.feature.modelPolygons
-            .expand((poly) => {
-                  poly.rings.map(
-                      (ring) => List.of(ring.points)..add(ring.points.first))
-                })
-            .flattened
-            .toList();
+        final outlines = <List<TilePoint>>[
+          for (final polygon in feature.feature.modelPolygons)
+            for (final ring in polygon.rings) _ClosedRing(ring.points),
+        ];
 
         return (paint, outlines);
       }
@@ -80,9 +106,10 @@ class SceneLineBuilder {
     return null;
   }
 
-  void _addMesh(List<List<TilePoint>> lines, double lineWidth, int extent,
-      PaintModel paint, List<double>? dashLengths) {
-    final (vertices, indices) = LineGeometryBuilder().build(
+  void _addMesh(List<List<TilePoint>> lines, int points, double lineWidth,
+      int extent, PaintModel paint, List<double>? dashLengths) {
+    final (vertices, indices) =
+        LineGeometryBuilder(expectedPoints: points).build(
       lines,
       paint.lineCap ?? LineCap.DEFAULT,
       paint.lineJoin ?? LineJoin.DEFAULT,

@@ -1,76 +1,94 @@
 import 'dart:typed_data';
 
 import 'package:flutter_gpu/gpu.dart' as gpu;
-import 'package:flutter_scene/scene.dart';
-import 'package:vector_math/vector_math.dart';
 
-/// Base class for the tile renderer's geometries.
+import 'static_uniform.dart';
+
+/// Base class for the tile renderer's geometries: a vertex shader and the
+/// vertex (and optional index) buffer it reads.
 ///
-/// flutter_scene 0.18.1 delivers the per-draw model transform through an
-/// instance-rate vertex buffer (see [UnskinnedGeometry.instancedVertexLayout]
-/// / `kUnskinnedInstancedLayout`) and validates that layout *by attribute
-/// name* against the bound vertex shader. Our geometries use custom vertex
-/// shaders with their own inputs (`SimpleVertex`, `LineVertex`, ...) that read
-/// the model transform from a `FrameInfo` uniform, so the standard instanced
-/// layout does not apply. Without this override the pipeline build throws e.g.
-/// "VertexAttribute name 'position' does not match any input declared by the
-/// bound vertex shader".
-///
-/// This base therefore:
-///  * returns a null [instancedVertexLayout], so the pipeline is built from
-///    the shader's own reflected vertex descriptor (no name mismatch) and the
-///    encoder takes the non-instanced, per-draw-uniform path; and
-///  * fills, in [bind], the `FrameInfo` UBO our shaders expect
-///    ({ model_transform, camera_transform, camera_position }) — which
-///    flutter_scene's own `UnskinnedGeometry.bind` no longer provides now that
-///    the model transform moved to the instance buffer.
-abstract class TileGeometry extends UnskinnedGeometry {
-  gpu.BufferView? _vertexBufferView;
-  gpu.BufferView? _indexBufferView;
-  gpu.IndexType _tileIndexType = gpu.IndexType.int16;
+/// The shaders read the tile's model transform and the camera from a
+/// `FrameInfo` uniform ({ model_transform, camera_transform,
+/// camera_position }), which the render pass emplaces once per tile and
+/// passes to [bind].
+abstract class TileGeometry {
+  late final gpu.Shader vertexShader;
+  late final gpu.UniformSlot _frameInfoSlot =
+      vertexShader.getUniformSlot('FrameInfo');
 
-  @override
-  gpu.VertexLayout? get instancedVertexLayout => null;
+  gpu.BufferView? _vertices;
+  int _vertexCount = 0;
+  gpu.BufferView? _indices;
+  gpu.IndexType _indexType = gpu.IndexType.int16;
+  int _indexCount = 0;
+  bool _indexed = false;
 
-  // Capture the buffer views as they pass through so [bind] can rebind them
-  // (the base class keeps them private). Both setters are the sink for
-  // `uploadVertexData`.
-  @override
-  void setVertices(gpu.BufferView vertices, int vertexCount) {
-    super.setVertices(vertices, vertexCount);
-    _vertexBufferView = vertices;
+  /// The uniform blocks that never change, uploaded once with the tile.
+  List<StaticUniform> get staticUniforms => const [];
+
+  void setVertexShader(gpu.Shader shader) {
+    vertexShader = shader;
   }
 
-  @override
-  void setIndices(gpu.BufferView indices, gpu.IndexType indexType) {
-    super.setIndices(indices, indexType);
-    _indexBufferView = indices;
-    _tileIndexType = indexType;
-  }
+  /// Whether there is nothing to draw. An indexed geometry whose index data
+  /// is empty (e.g. earcut found no triangles) draws nothing, rather than
+  /// its vertices as an unindexed triangle list.
+  bool get isEmpty =>
+      _vertices == null || (_indexed ? _indexCount : _vertexCount) == 0;
 
-  @override
-  void bind(
-    gpu.RenderPass pass,
-    gpu.HostBuffer transientsBuffer,
-    Matrix4 modelTransform,
-    Matrix4 cameraTransform,
-    Vector3 cameraPosition,
-  ) {
-    pass.bindVertexBuffer(_vertexBufferView!);
-    final indices = _indexBufferView;
-    if (indices != null) {
-      pass.bindIndexBuffer(indices, _tileIndexType);
+  /// Uploads [vertices] (and [indices], if any) into one host-visible device
+  /// buffer, indices right after the vertices.
+  void uploadVertexData(
+    ByteData vertices,
+    int vertexCount,
+    ByteData? indices, {
+    gpu.IndexType indexType = gpu.IndexType.int16,
+  }) {
+    if (vertices.lengthInBytes == 0) {
+      return;
     }
-
-    // FrameInfo UBO, std140: mat4 model_transform, mat4 camera_transform,
-    // vec3 camera_position (16 + 16 + 3 floats).
-    final frameInfo = Float32List(35)
-      ..setRange(0, 16, modelTransform.storage)
-      ..setRange(16, 32, cameraTransform.storage)
-      ..setRange(32, 35, [cameraPosition.x, cameraPosition.y, cameraPosition.z]);
-    pass.bindUniform(
-      vertexShader.getUniformSlot('FrameInfo'),
-      transientsBuffer.emplace(ByteData.sublistView(frameInfo)),
+    final indexBytes = indices?.lengthInBytes ?? 0;
+    final buffer = gpu.gpuContext.createDeviceBuffer(
+      gpu.StorageMode.hostVisible,
+      vertices.lengthInBytes + indexBytes,
     );
+    buffer.overwrite(vertices, destinationOffsetInBytes: 0);
+    _vertices = gpu.BufferView(
+      buffer,
+      offsetInBytes: 0,
+      lengthInBytes: vertices.lengthInBytes,
+    );
+    _vertexCount = vertexCount;
+    _indexed = indices != null;
+    if (indices != null && indexBytes > 0) {
+      buffer.overwrite(indices,
+          destinationOffsetInBytes: vertices.lengthInBytes);
+      _indices = gpu.BufferView(
+        buffer,
+        offsetInBytes: vertices.lengthInBytes,
+        lengthInBytes: indexBytes,
+      );
+      _indexType = indexType;
+      _indexCount = indexBytes ~/ (indexType == gpu.IndexType.int16 ? 2 : 4);
+    }
+  }
+
+  /// Binds the buffers and the tile's [frameInfo] for the next draw.
+  void bind(
+      gpu.RenderPass pass, gpu.HostBuffer host, gpu.BufferView frameInfo) {
+    pass.bindVertexBuffer(_vertices!);
+    final indices = _indices;
+    if (indices != null) {
+      pass.bindIndexBuffer(indices, _indexType);
+    }
+    pass.bindUniform(_frameInfoSlot, frameInfo);
+  }
+
+  void draw(gpu.RenderPass pass) {
+    if (_indexed) {
+      pass.drawIndexed(_indexCount);
+    } else {
+      pass.draw(_vertexCount);
+    }
   }
 }

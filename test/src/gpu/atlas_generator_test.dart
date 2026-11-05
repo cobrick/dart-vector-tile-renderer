@@ -387,6 +387,54 @@ void main() {
       expect(base.length, lessThanOrEqualTo(AtlasGenerator.maxAtlasChars));
     });
   });
+
+  group('loadGlyphs', () {
+    test('loads atlases covering every glyph of each font for the tile',
+        () async {
+      const other = 'Roboto%italic';
+      final atlases = generator((id) async => _atlas(id));
+      final glyphs = {
+        font: 'ab'.codeUnits.toSet(),
+        other: 'xy'.codeUnits.toSet(),
+      };
+
+      final loaded = await atlases.loadGlyphs(glyphs, 't1');
+
+      expect(AtlasSet(loaded).covers(glyphs), isTrue);
+      expect(provider.forTileID('t1').covers(glyphs), isTrue);
+      expect(provider.forTileID('t2').covers(glyphs), isFalse);
+    });
+
+    test('leaves a withheld atlas out of the result', () async {
+      final atlases = generator((id) async => null);
+
+      final loaded = await atlases.loadGlyphs({
+        font: {'a'.codeUnitAt(0)},
+      }, 't1');
+
+      expect(loaded, isEmpty);
+      expect(hasAtlas('t1'), isFalse);
+    });
+
+    test('requests at most maxAtlasChars characters per atlas', () async {
+      final built = <String>[];
+      final atlases = generator((id) async {
+        built.add(id.chars);
+        return _atlas(id);
+      });
+      final glyphs = {
+        font: {for (var c = 0x100; c < 0x100 + 300; c++) c},
+      };
+
+      await atlases.loadGlyphs(glyphs, 't1');
+
+      expect(built, hasLength(2));
+      for (final chars in built) {
+        expect(chars.length, lessThanOrEqualTo(AtlasGenerator.maxAtlasChars));
+      }
+      expect(provider.forTileID('t1').covers(glyphs), isTrue);
+    });
+  });
 }
 
 class _ThrowingLogger implements Logger {

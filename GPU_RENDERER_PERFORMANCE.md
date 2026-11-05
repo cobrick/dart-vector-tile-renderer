@@ -4,6 +4,233 @@ This file records the GPU renderer baseline and the follow-up work aimed at
 making pan and zoom smoother. It is intentionally separate from the regular
 package README so profiling decisions have one source of truth.
 
+## Current Pipeline: One 2D Render Pass (AMPS-3216)
+
+Each map layer (`TilesRenderer`: world, labels) draws its visible tiles with
+`MapRenderPass`, one Flutter GPU render pass per frame:
+
+- **Target**: an 8-bit RGBA texture from a ring of three (the GPU never draws
+  into a texture the compositor may still read), sized to the layer's area in
+  physical pixels. With anti-aliasing, the pass draws into a 4× multisampled
+  texture in transient (on-chip) memory and resolves into the target at the
+  end of the pass. `MapAntiAliasing.fxaa` and `auto` mean MSAA too; labels
+  default to none (`GpuMapSettings.labelAntiAliasing`), their SDF edges are
+  already smooth.
+- **Order**: meshes draw in style-layer order across all visible tiles
+  (`layerMajorOrder`), with straight-alpha blending and no depth buffer, so
+  each layer paints over the ones below it. Each packed mesh records its style
+  layer index (`PackedMesh.layer`) for this. Drawing layer by layer also keeps
+  geometry in a tile's buffer zone under the neighbouring tile's higher layers.
+- **Colours**: style colours are written as they are, with no tone mapping or
+  gamma, so the screen shows the style's values.
+- **Per frame**: one `FrameInfo` uniform per tile, pipelines cached per shader
+  pair, material and geometry uniforms emplaced in one host buffer.
+- **Composite**: `canvas.drawImageRect` of the target into the layer's area.
+
+It replaced flutter_scene's 3D pipeline, which per frame and per layer drew
+into a 16-bit HDR target with a depth buffer, ran a full-screen tone-mapping
+pass and (on FXAA profiles) a full-screen FXAA pass, and sorted opaque and
+translucent meshes. That pipeline also rendered pixelRatio² as many pixels as
+the screen shows, because the canvas was already scaled to physical pixels.
+flutter_scene is still a dependency for raster tilesets
+(`gpuTextureFromImage`) only.
+
+### Measured (2026-11-05)
+
+Release builds of Tactical Commander (Galaxy Tab Active5 8", Mali-G68,
+Vulkan) and Base Station (Galaxy Tab Active5 Pro, Vulkan), both at
+120 Hz. The app drives the camera along the same scripted route (swipes at
+zoom 14, 16 and 11, a continuous pan at 13, zooms); only frames whose vsync
+falls while the camera moves count. Mean of two runs.
+
+| Build | 8" fps | 8" UI p50 | 8" frames > 16.7 ms | 8" GPU MB | Pro fps | Pro UI p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline (`e5f5b93`) | 44.9 | 18.9 ms | 86% | 313 | 64.4 | 12.9 ms |
+| Labels without FXAA (`9a25154`) | 49.0 | 17.2 ms | 69% | 286 | 69.2 | 11.8 ms |
+| Screen resolution (`4316971`) | 64.3 | 12.6 ms | 13% | 207 | 85.1 | 9.3 ms |
+| 2D render pass (this) | 97.2 | 5.0 ms | 4% | 156 | 101.6 | 4.6 ms |
+
+Diagnostics on the baseline showed the UI thread mostly waited for GPU work:
+at half resolution the 8" ran at 93 fps, with the labels layer off at 70.
+
+## Tiles Are Prepared in One Worker Job (AMPS-3216)
+
+With drawing cheap, the remaining hitches while panning came from moving
+decoded tiles between isolates. A worker decoded each tile and its `Tile`
+object graph came back to the UI isolate. The UI isolate walked every feature
+for the glyphs its labels need, then copied the decoded `Tileset` into the
+pre-render job. Copying that object graph blocked the UI thread for 17–47 ms
+(p90) and up to 105 ms per tile.
+
+Now one worker job prepares a tile from its encoded bytes
+(`TilesRenderer.preRender`, run by vector_map_tiles' `MapLayer`):
+
+- The job decodes the tile, collects the glyphs its labels need, and lays it
+  out. Only the render data comes back; the decoded tile never crosses
+  isolates.
+- Glyph atlases stay on the UI isolate. The job carries, as plain data, each
+  font's largest atlas among those tiles already use (`preRenderInput`).
+  When they hold every glyph, the tile is laid out in one pass; when not, the
+  job returns the glyphs, the UI isolate generates atlases (`loadGlyphs`) and
+  the tile is laid out again with them.
+- A tile keeps only the atlases of fonts its labels use
+  (`keepUsedAtlases`). Atlases offered to tiles still in flight stay loaded
+  for them but are never offered on, so a font's atlas is released once no
+  laid-out tile uses it.
+- Queued jobs of tiles that left the view are dropped before a worker runs
+  them.
+
+Measured on the same route and devices as above, three interleaved runs per
+build, mean (2026-11-05):
+
+| Build | 8" fps | 8" frames > 16.7 ms | 8" UI p99 | 8" tile latency p50 | Pro fps | Pro UI p99 | Pro tile latency p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Exact tile clip (`2fa00de`) | 97.2 | 3.6% | 23.6 ms | 82 ms | 102.0 | 23.4 ms | 86 ms |
+| One worker job (this) | 108.4 | 2.5% | 20.3 ms | 48 ms | 113.1 | 22.3 ms | 54 ms |
+
+Handing a tile to a worker now costs the UI thread 0.1–0.2 ms (p90) instead
+of 13–41 ms. GPU memory is unchanged; the app's PSS fell by 10–14 MB.
+
+The Pro's single worst frame per run was longer (64 → 73 ms, mean of six
+runs) while frames over 33 ms stayed at 0.3%. In both builds the Pro's
+longest frames are UI-thread pauses with no tile work in them (no upload,
+result, load or hand-off in the frame), unlike the 8", where the old
+glyph walk and hand-off filled them and they got shorter (61 → 47 ms).
+
+Where render data lives was tested and kept: returning it in a
+`TransferableTypedData` (outside the Dart heap, as before this change) cut
+the app's PSS by another ~50 MB on both tablets, but cost about 1% fps and
+part of the gain in frames over 16.7 ms (Pro 1.7% → 2.0%), and did not
+shorten the Pro's longest frames. The render data now arrives as a plain
+`Uint8List` copied into the shared heap by the worker.
+
+A tile is laid out at the camera zoom of the moment its preparation starts,
+as before. After a zoom animation that moment comes earlier now, so line
+widths in tiles loaded during the animation can differ by a fraction of a
+pixel from the previous build; shots taken at a settled zoom are
+pixel-identical.
+
+## UI Freezes Come From Worker Garbage (AMPS-3216)
+
+A Dart VM timeline of a profile build on the Pro (GC, Dart and Embedder
+streams, the same route) showed what the longest UI frames are: the paint
+phase stretched to 25–60 ms while the UI thread was stopped for garbage
+collection. Every one of the 20 longest paint phases overlapped one to
+three scavenges run by worker isolates. The map's workers share their
+heap with the UI isolate, so each of their collections pauses the UI
+thread wherever it is. Over 203 s the workers ran 397 scavenges (2.3 s of
+pauses, up to 21 ms each).
+
+A CPU profile of the workers put a quarter of their time in the protobuf
+parse alone: `VectorTile.fromBytes` builds a protobuf message per feature,
+grows every geometry and tag list element by element, and then copies it
+all into `VectorTile` objects, for every layer in the tile. Four changes cut
+that garbage, each with identical output:
+
+- `decodeMvt` (`mvt_decoder.dart`) reads the wire format straight into
+  `VectorTile`, with geometry and tags in exact-size typed lists, and skips
+  the layers it is not asked for without decoding them. Malformed tiles and
+  protobuf groups fall back to `VectorTile.fromBytes`, as does the web,
+  where ints are not 64-bit. `TileFactory` builds each feature's
+  properties in one map instead of two.
+- `TileFactory.layerNamesAt(zoom)`: only the source layers some theme layer
+  can draw at the tile's zoom are decoded. The labels theme uses the roads
+  only for one-way arrows from zoom 15 and house numbers from zoom 17, so
+  below that it no longer decodes the largest layer of the tile.
+- `LineGeometryBuilder` writes every segment, join and cap straight into
+  growing typed vertex and index buffers. It used to make three lists per
+  segment and join them through a `BytesBuilder`, and `SceneLineBuilder`
+  copied every polygon ring to close it (now a view, `_ClosedRing`).
+- A feature's geometry is decoded when a theme layer first reads it
+  (`TileDataFeature.toTileFeature`): the features no layer's filter selects
+  are never turned into point objects. `TileFeature` keeps its canvas-only
+  paths in late fields instead of three `LazyValue` holders per feature.
+
+| Pro, 203 s traced | Worker scavenges (count / pause) | UI frames over 16.7 ms | Longest UI frame |
+| --- | --- | --- | --- |
+| Before | 397 / 2,333 ms | 160 | 62.6 ms |
+| Decoder | 270 / 1,678 ms | 109 | 58.7 ms |
+| + layers by zoom | 267 / 1,579 ms | 104 | 54.3 ms |
+| + line meshes in typed buffers | 211 / 1,232 ms | 80 | 41.3 ms |
+| + geometry decoded on first read | 182 / 870 ms | 63 | 48.9 ms |
+
+Release builds, three interleaved runs per step on the Pro (two on the
+8"), from before the decoder to geometry decoded on first read: fps
+113.1 → 117.2 (8" 108.7 → 112.9), frames over 16.7 ms 1.8% → 0.7%
+(8" 2.5% → 1.1%), UI p99 22.5 → 14.6 ms (8" 20.8 → 16.8 ms), new tiles
+ready 56 → 36 ms (8" 50 → 28 ms). A single worst frame per run stays
+noisy (40–84 ms on the Pro, 40–58 ms on the 8"); most of those frames
+hold no tile work at all.
+
+What is left after these: see the next section.
+
+## What the Remaining Slow Frames Are (AMPS-3216)
+
+The bench splits every UI frame (begin frame to the end of draw frame)
+into time on a CPU (the thread's CPU clock), time runnable but waiting for
+a core (schedstat's run delay) and the rest, blocked; and the map's own
+work into encoding the render passes, submitting them, compositing them and
+uploading new tiles. schedstat's CPU field is not usable for this: for a
+running thread it lags by up to a scheduler tick, which made ordinary
+frames look 1.4 ms blocked.
+
+On the Pro a typical moving frame is CPU-bound: 5.4 ms, of which 5.3 ms on
+a CPU and 0.2 ms blocked. The slow frames (about 55 per run over 16.7 ms)
+are 60% CPU, 10% waiting for a core and 30% blocked, with about 15 context
+switches each against 1.4 in an ordinary frame. The map's own work is about
+a third of their time (encode 1.2 ms per frame for both passes, submit
+0.5 ms, composite 0.1 ms, an upload now and then); the rest is the
+framework, the app's other layers and garbage collection.
+
+Three changes, each measured on its own against the build before it
+(interleaved, three runs on the Pro, two on the 8"):
+
+- `TileRenderData.pack` returned a view of a growing `BytesBuilder`'s
+  power-of-two buffer, and a typed-data view sent to another isolate takes
+  its whole backing buffer along: up to 2.3× each tile's render data
+  crossed from the worker and stayed in the UI isolate's heap. It now packs
+  one exact-size list.
+- No allocations per draw: uniforms that never change are uploaded once per
+  tile into one device buffer (`StaticUniform`) instead of copied into the
+  frame's host buffer at every draw; labels that have faded in share one
+  `Age` block; the layer-major order is walked, not built; each `MapDraw`
+  keeps its pipeline; `FrameInfo` goes through one scratch block.
+- `PolygonGeometryBuilder` writes into growing typed buffers and reuses
+  one coordinate list, and `NdcLabelSpace` tests overlaps without
+  allocating (no lists, points or projections per test, no candidate set
+  per query). Labels along a line try a box at many positions, so this
+  ran very often on the workers.
+
+| Change | Pro | 8" |
+| --- | --- | --- |
+| Render data packed exactly | PSS 449 → 388 MB, slow frames per run 56 → 48, UI p99 16.6 → 15.7 ms | PSS 451 → 401 MB, frame times unchanged |
+| No allocations per draw | fps 116.4 → 116.7, UI p50 5.7 → 5.5 ms, p90 7.8 → 7.4 ms, encode −13% | frames over 16.7 ms 2.2% → 1.6%, UI p50 5.9 → 5.4 ms, p99 19.9 → 18.5 ms |
+| Polygons and labels without garbage | fps 116.9 → 117.3, frames over 16.7 ms 0.7% → 0.6%, UI p90 6.2 → 5.8 ms, p99 15.1 → 13.8 ms | fps 112.4 → 113.0, frames over 16.7 ms 1.5% → 1.3%, UI p99 18.1 → 17.2 ms |
+
+| Pro, 203 s traced | Worker scavenges (count / pause) | UI frames over 16.7 ms | Over 33 ms | Longest UI frame |
+| --- | --- | --- | --- | --- |
+| Geometry decoded on first read (above) | 182 / 870 ms | 63 | 3 | 48.9 ms |
+| + render data exact, no allocations per draw | 187 / 891 ms | 63 | 10 | 45.0 ms |
+| + polygons and labels without garbage | 144 / 767 ms | 51 | 2 | 40.7 ms |
+
+Tested, not kept: a cap on upload time per update (4 ms on top of the
+count cap). A tile takes 0.1–3 ms to upload (p90), so the cap rarely bit:
+no change in slow frames on either tablet, tiles ready up to 4 ms later.
+
+Fewer tile workers, an app setting (`VectorTileDeviceProfile` in
+apollo_uikit): 3 map + 1 label workers on the Galaxy tablets instead of
+4 + 2. Six busy workers competed with the UI thread for the four fast
+cores, and each one's collections pause it. Pro: frames over 16.7 ms
+0.8% → 0.6%, slow frames per run 44 → 34, slowest frame 41 → 36 ms, new
+tiles ready 38 → 33 ms (p50). 8": 1.8% → 1.4%, tiles ready 27 → 26 ms.
+The blank share during fast swipes at zoom 14 rose from about 0.9% to
+1.05% of the screen on the Pro.
+
+What is left: the UI isolate allocates mostly outside the map (the
+framework and the app's layers rebuilt on every camera move, about one
+scavenge a second), old-generation collections (about one every 2.8 s),
+and worker scavenges (144 per 203 s).
+
 ## Committed Baseline
 
 The baseline is commit `1763352` (`feat: port GPU tile renderer to
@@ -32,6 +259,9 @@ visually correct GPU-rendering base on which tile scheduling and reuse work.
 
 ### Frustum Culling Is Currently Unusable
 
+Obsolete since the 2D render pass: `GpuMapSettings.frustumCulling` has no
+effect, and `viewportCulling` skips off-screen tiles.
+
 Frustum culling has been tested on-device and must remain disabled
 (`GpuMapSettings.frustumCulling = false`). Enabling it produces a rectangle
 artifact around the centre of the map and causes text to disappear, which
@@ -55,6 +285,21 @@ The upper scan bound is clamped with `min(..., 1)`, matching the lower bound's
 even when the configured SDF radius had already been reached. Keep this
 change: it reduces unnecessary fragment work without changing the configured
 distance range or dropping glyph data.
+
+## Style Colours Pass Through Unchanged (AMPS-3216)
+
+flutter_scene renders into a linear HDR target, and its resolve pass
+tone-maps (PBR Neutral by default) and gamma-encodes with a fixed
+`pow(1/2.2)`. Map style colours are already display (sRGB) values, so the
+map came out lighter than its style. Measured on the dark theme (8"
+Galaxy Tab Active5): buildings rgb(24, 24, 24) showed as 68 grey, major
+roads 85 as 146, and water rgba(90, 173, 255, 0.21) over black as
+(56, 91, 115) instead of (19, 36, 54).
+
+The first fix set linear tone mapping and a colour-grading gamma of 1/2.2,
+which cancelled the final encode. The 2D render pass (above) has no tone
+mapping or gamma at all. Blending happens on the style's sRGB values, like
+MapLibre and the canvas renderer.
 
 ## Current Uncommitted Smoothing Work
 

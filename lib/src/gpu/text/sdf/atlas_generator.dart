@@ -87,7 +87,9 @@ class AtlasGenerator {
     _stats.reset();
   }
 
-  Future loadAtlas(
+  /// Loads an atlas holding [str] in [fontFamily] for tile [tileID] and
+  /// returns it, or null when it was withheld.
+  Future<GlyphAtlas?> loadAtlas(
       {required String str,
       required String fontFamily,
       required String tileID}) async {
@@ -124,9 +126,32 @@ class AtlasGenerator {
     // that label-less render data until it leaves the tile cache. The next
     // request for these characters generates the atlas again.
     if (atlas == null) {
-      return;
+      return null;
     }
     atlasProvider.addLoaded({atlas}, tileID);
+    return atlas;
+  }
+
+  /// Loads atlases covering [glyphs] (the characters each font needs) for
+  /// tile [tileID], at most [maxAtlasChars] characters per request, and
+  /// returns them. Withheld atlases are missing from the result.
+  Future<Set<GlyphAtlas>> loadGlyphs(
+      Map<String, Set<int>> glyphs, String tileID) async {
+    final loaded = <GlyphAtlas>{};
+    for (final MapEntry(key: font, value: charCodes) in glyphs.entries) {
+      final sorted = charCodes.toList()..sort();
+      for (var i = 0; i < sorted.length; i += maxAtlasChars) {
+        final end = math.min(i + maxAtlasChars, sorted.length);
+        final atlas = await loadAtlas(
+            str: String.fromCharCodes(sorted.sublist(i, end)),
+            fontFamily: font,
+            tileID: tileID);
+        if (atlas != null) {
+          loaded.add(atlas);
+        }
+      }
+    }
+    return loaded;
   }
 
   /// The atlas to reuse for [str]: a completed one before an in-flight one,

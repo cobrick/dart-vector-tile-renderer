@@ -1,30 +1,24 @@
-import 'dart:typed_data';
-
 import 'package:flutter_gpu/gpu.dart';
-import 'package:flutter_scene/scene.dart';
-import '../tile_render_data.dart';
-import '../utils.dart';
 
+import '../map_material.dart';
 import '../shaders.dart';
+import '../static_uniform.dart';
+import '../tile_render_data.dart';
 
-class LineMaterial extends Material {
-  late final ByteData _uniform;
+class LineMaterial extends MapMaterial {
+  LineMaterial(PackedMaterial packed)
+      : _uniform = StaticUniform(packed.uniform!),
+        super(shaderLibrary["LineFragment"]!);
 
-  LineMaterial(PackedMaterial packed) {
-    setFragmentShader(shaderLibrary["LineFragment"]!);
-
-    _uniform = packed.uniform!;
-  }
+  final StaticUniform _uniform;
+  late final UniformSlot _lineMaterialSlot =
+      fragmentShader.getUniformSlot('LineMaterial');
 
   @override
-  void bind(
-      RenderPass pass, HostBuffer transientsBuffer, Lighting lighting) {
-    super.bind(pass, transientsBuffer, lighting);
+  List<StaticUniform> get staticUniforms => [_uniform];
 
-    final lineMaterialSlot = fragmentShader.getUniformSlot('LineMaterial');
-    final lineMaterialView = transientsBuffer.emplace(_uniform);
-    pass.bindUniform(lineMaterialSlot, lineMaterialView);
-
-    configureRenderPass(pass);
+  @override
+  void bind(RenderPass pass, HostBuffer host) {
+    pass.bindUniform(_lineMaterialSlot, _uniform.view(host));
   }
 }

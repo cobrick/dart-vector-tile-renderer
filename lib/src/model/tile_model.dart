@@ -2,7 +2,6 @@ import 'dart:ui';
 
 import 'geometry_model.dart';
 import 'geometry_model_ui.dart';
-import 'lazy_value.dart';
 
 class Tile {
   final List<TileLayer> layers;
@@ -72,13 +71,12 @@ class TileFeature {
 
   bool get hasPolygons => type == TileFeatureType.polygon;
 
-  final _points = LazyValue<List<Offset>>();
-  final _paths = LazyValue<List<BoundedPath>>();
-  final _compoundPath = LazyValue<BoundedPath>();
-
-  List<Offset> get points => _points.get(_computePoints);
-  List<BoundedPath> get paths => _paths.get(_computePaths);
-  BoundedPath get compoundPath => _compoundPath.get(_computeCompoundPath);
+  // Computed on first read, for the canvas renderer. Late fields rather
+  // than a LazyValue holder each: the GPU renderer never reads them, and
+  // three holders per feature were garbage on the map's worker isolates.
+  late final List<Offset> points = _computePoints();
+  late final List<BoundedPath> paths = _computePaths();
+  late final BoundedPath compoundPath = _computeCompoundPath();
 
   List<Offset> _computePoints() {
     if (type != TileFeatureType.point) {

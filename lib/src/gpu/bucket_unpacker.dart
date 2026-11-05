@@ -1,59 +1,54 @@
-import 'package:flutter_scene/scene.dart';
-import 'package:vector_math/vector_math.dart';
-
 import '../tileset_raster.dart';
 import 'background/background_geometry.dart';
-import 'gpu_map_settings.dart';
 import 'colored_material.dart';
 import 'line/line_geometry.dart';
 import 'line/line_material.dart';
+import 'map_material.dart';
+import 'map_render_pass.dart';
 import 'polygon/polygon_geometry.dart';
 import 'raster/raster_layer_builder.dart';
+import 'static_uniform.dart';
 import 'text/text_geometry.dart';
 import 'text/text_material.dart';
 import 'texture_provider.dart';
+import 'tile_geometry.dart';
 import 'tile_render_data.dart';
 
+/// Turns a tile's packed meshes into GPU geometry and materials, uploading
+/// the vertex data. The draws keep the packed (style layer) order.
 class BucketUnpacker {
   final TextureProvider textureProvider;
   final RasterTileset rasterTileset;
 
   BucketUnpacker(this.textureProvider, this.rasterTileset);
 
-  /// Keep all layer depths inside Impeller's [0, 1] clip-space z range while
-  /// making layer order dominate flutter_scene's translucent depth sort.
-  static const _maxLayerDepth = 0.95;
-
-  void unpackOnto(Node parent, TileRenderData bucket) {
-    final layerCount = bucket.data.length;
-    var layer = 0;
-    for (var packedMesh in bucket.data) {
-      final layerDepth = layerCount <= 1
-          ? 0.0
-          : _maxLayerDepth * (layerCount - 1 - layer) / (layerCount - 1);
-      final layerTransform =
-          Matrix4.translation(Vector3(0, 0, layerDepth));
-      if (packedMesh.geometry.type == GeometryType.raster) {
-        final node = Node(localTransform: layerTransform)
-          ..frustumCulled = GpuMapSettings.frustumCulling;
-        parent.add(node);
-        RasterLayerBuilder().build(node, packedMesh.geometry.uniform!,
-            packedMesh.material.uniform!, rasterTileset);
+  List<MapDraw> unpack(TileRenderData bucket) {
+    final draws = <MapDraw>[];
+    for (final packed in bucket.data) {
+      if (packed.geometry.type == GeometryType.raster) {
+        final draw = RasterLayerBuilder().build(packed.layer,
+            packed.geometry.uniform!, packed.material.uniform!, rasterTileset);
+        if (draw != null) {
+          draws.add(draw);
+        }
       } else {
-        parent.add(Node(
-          localTransform: layerTransform,
-          mesh: Mesh(_unpackGeometry(packedMesh.geometry),
-              _unpackMaterial(packedMesh.material)),
-        )..frustumCulled = GpuMapSettings.frustumCulling);
+        draws.add(MapDraw(packed.layer, _unpackGeometry(packed.geometry),
+            _unpackMaterial(packed.material)));
       }
-      layer++;
     }
+    uploadStaticUniforms([
+      for (final draw in draws) ...[
+        ...draw.geometry.staticUniforms,
+        ...draw.material.staticUniforms,
+      ],
+    ]);
+    return draws;
   }
 
-  Material _unpackMaterial(PackedMaterial packed) =>
+  MapMaterial _unpackMaterial(PackedMaterial packed) =>
       _materialConstructors[packed.type.index]!.call(packed, textureProvider);
 
-  Geometry _unpackGeometry(PackedGeometry packed) =>
+  TileGeometry _unpackGeometry(PackedGeometry packed) =>
       _geometryConstructors[packed.type.index]!.call(packed);
 }
 
@@ -72,7 +67,8 @@ enum MaterialType {
   text,
 }
 
-final _geometryTypeToConstructor = {
+final _geometryTypeToConstructor =
+    <GeometryType, TileGeometry Function(PackedGeometry)>{
   GeometryType.line: (a) => LineGeometry(a),
   GeometryType.polygon: (a) => PolygonGeometry(a),
   GeometryType.background: (a) => BackgroundGeometry(),
@@ -83,7 +79,8 @@ final _geometryTypeToConstructor = {
 final _geometryConstructors =
     GeometryType.values.map((v) => _geometryTypeToConstructor[v]).toList();
 
-final _materialTypeToConstructor = {
+final _materialTypeToConstructor =
+    <MaterialType, MapMaterial Function(PackedMaterial, TextureProvider)>{
   MaterialType.line: (a, b) => LineMaterial(a),
   MaterialType.colored: (a, b) => ColoredMaterial(a),
   MaterialType.raster: (a, b) => throw UnimplementedError(),

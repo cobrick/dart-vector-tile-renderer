@@ -84,11 +84,16 @@ class _MapTileState extends State<MapTile> {
     final tileset = await _loadTileset();
     _tileset = tileset;
     await TilesRenderer.initialize;
-    await gpuRenderer.preRenderUi(
-        zoom, tileset, TileId(z: 0, x: 0, y: 0).key());
-    _renderData = gpuRenderer
-        .getPreRenderer()
-        .call(theme, zoom, tileset, TileId(z: 0, x: 0, y: 0).key());
+    final tileID = TileId(z: 0, x: 0, y: 0).key();
+    var output = TilesRenderer.preRender(
+        theme, zoom, tileset, gpuRenderer.preRenderInput(tileID));
+    if (output.renderData == null) {
+      // The labels need glyphs that no atlas holds yet.
+      final input = await gpuRenderer.loadGlyphs(output, tileID);
+      output = TilesRenderer.preRender(theme, zoom, tileset, input);
+    }
+    gpuRenderer.keepUsedAtlases(output, tileID);
+    _renderData = output.renderData;
     if (!_disposed) {
       setState(() {});
     }

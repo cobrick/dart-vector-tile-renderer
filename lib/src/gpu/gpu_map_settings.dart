@@ -1,22 +1,23 @@
 import '../logger.dart';
 
-/// Anti-aliasing quality for the flutter_gpu vector map.
+/// Anti-aliasing for the flutter_gpu vector map.
 ///
-/// Higher quality means smoother edges but more GPU cost per frame. On slow
-/// devices, dropping from [msaa] to [fxaa] or [none] is the biggest single
-/// performance lever.
+/// The map draws in one 2D pass. Anti-aliasing is 4× MSAA in transient
+/// (on-chip) memory, resolved at the end of the pass: cheap on the tile-based
+/// GPUs of mobile devices. Without offscreen MSAA support the map draws
+/// without anti-aliasing.
 enum MapAntiAliasing {
   /// No anti-aliasing. Fastest; edges are aliased ("pixelated").
   none,
 
-  /// Cheap full-screen post-process AA. Softer edges at low cost.
+  /// Kept for existing configurations: the 2D pass has no FXAA, so this
+  /// draws with MSAA, like [msaa].
   fxaa,
 
-  /// 4x multisample AA. Best edge quality, highest cost (the historical
-  /// default). Falls back to [fxaa] on backends without MSAA support.
+  /// 4× multisample anti-aliasing.
   msaa,
 
-  /// MSAA where the backend supports it, otherwise FXAA.
+  /// The same as [msaa].
   auto,
 }
 
@@ -26,16 +27,19 @@ enum MapAntiAliasing {
 /// These are process-wide (the renderer is created deep inside
 /// `vector_map_tiles`, which exposes no configuration hook), so set them once —
 /// e.g. from app startup or a debug settings screen — to trade quality for
-/// frame rate. [antiAliasing] applies on the next rendered frame;
-/// [frustumCulling] applies the next time tiles are (re)built (pan/zoom or a
-/// hot restart).
+/// frame rate. [antiAliasing] applies on the next rendered frame.
 class GpuMapSettings {
   GpuMapSettings._();
 
   /// Anti-aliasing mode. Defaults to [MapAntiAliasing.msaa].
   static MapAntiAliasing antiAliasing = MapAntiAliasing.msaa;
 
-  /// Number of recently off-screen GPU tile nodes to retain per renderer.
+  /// Anti-aliasing mode of a renderer whose theme holds only symbol (label)
+  /// layers. Defaults to [MapAntiAliasing.none]: labels are SDF-shaded, so
+  /// their edges are already smooth without it.
+  static MapAntiAliasing labelAntiAliasing = MapAntiAliasing.none;
+
+  /// Number of recently off-screen GPU tiles to retain per renderer.
   ///
   /// Set to zero to disable reuse. Higher values make backtracking pans
   /// smoother at the cost of GPU memory.
@@ -56,24 +60,18 @@ class GpuMapSettings {
   /// unaffected. Set to zero to disable the cap (upload everything each update).
   static int maxTileUploadsPerUpdate = 3;
 
-  /// Whether to frustum-cull tile geometry outside the camera view.
-  ///
-  /// When `true`, off-screen geometry is skipped, cutting draw calls when many
-  /// tiles are loaded. When `false` (default) every tile in the scene is drawn
-  /// each frame.
-  ///
-  /// Experimental: the map's orthographic camera does not yet produce a tight
-  /// view frustum, so enabling this can drop visible tiles — verify on-device.
+  /// Has no effect: the map no longer renders through flutter_scene's 3D
+  /// camera. [viewportCulling] skips off-screen tiles.
+  @Deprecated('No effect; use viewportCulling.')
   static bool frustumCulling = false;
 
   /// Whether to skip drawing tiles that fall entirely outside the viewport.
   ///
-  /// Unlike [frustumCulling] (which relies on the 3D camera frustum), this is a
-  /// cheap 2D test against the viewport in screen space: a tile is hidden only
-  /// when its screen rect lies beyond the circle enclosing the viewport, so it
-  /// is correct at any map rotation and never hides a visible tile. Culled
-  /// tiles stay uploaded in the scene (only [Node.visible] is toggled), so
-  /// nothing pops — only their per-frame draw is skipped.
+  /// A cheap 2D test against the viewport in screen space: a tile is skipped
+  /// only when its screen rect lies beyond the circle enclosing the viewport,
+  /// so it is correct at any map rotation and never hides a visible tile.
+  /// Culled tiles stay uploaded, so nothing pops — only their draws are
+  /// skipped that frame.
   static bool viewportCulling = true;
 
   /// Where the renderer reports glyph-atlas diagnostics.

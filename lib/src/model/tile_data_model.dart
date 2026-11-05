@@ -1,3 +1,5 @@
+import 'dart:collection';
+
 import 'geometry_decoding.dart';
 import 'geometry_model.dart';
 import 'tile_model.dart';
@@ -88,15 +90,56 @@ class TileDataFeature {
     return polygons;
   }
 
+  /// The feature for drawing. Its geometry is decoded when first read: a
+  /// feature that no theme layer's filter selects is never decoded.
   TileFeature toTileFeature() {
-    final tilePoints = hasPoints ? points.toList(growable: false) : null;
-    final tileLines = hasLines ? lines.toList(growable: false) : null;
-    final tilePolygons = hasPolygons ? polygons.toList(growable: false) : null;
     return TileFeature(
         type: type,
         properties: properties,
-        points: tilePoints,
-        lines: tileLines,
-        polygons: tilePolygons);
+        points: hasPoints
+            ? _DecodedOnRead(() => points.toList(growable: false))
+            : null,
+        lines: hasLines
+            ? _DecodedOnRead(() => lines.toList(growable: false))
+            : null,
+        polygons: hasPolygons
+            ? _DecodedOnRead(() => polygons.toList(growable: false))
+            : null);
   }
+}
+
+/// A read-only list whose elements are decoded on first read.
+///
+/// Decoding every feature's geometry up front made a point object per
+/// vertex for features no theme layer draws: garbage that, on the map's
+/// worker isolates, triggers collections of the heap they share with the UI
+/// isolate, each of which pauses the UI thread.
+class _DecodedOnRead<T> extends ListBase<T> {
+  _DecodedOnRead(this._decode);
+
+  List<T> Function()? _decode;
+  List<T>? _values;
+
+  List<T> get _list {
+    var values = _values;
+    if (values == null) {
+      values = _decode!();
+      _values = values;
+      _decode = null;
+    }
+    return values;
+  }
+
+  @override
+  int get length => _list.length;
+
+  @override
+  set length(int newLength) => throw UnsupportedError('Read-only geometry');
+
+  @override
+  T operator [](int index) => _list[index];
+
+  @override
+  void operator []=(int index, T value) =>
+      throw UnsupportedError('Read-only geometry');
 }

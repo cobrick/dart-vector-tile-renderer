@@ -1,66 +1,103 @@
+import 'dart:math';
 import 'dart:typed_data';
+
 import 'package:dart_earcut/dart_earcut.dart';
+
 import '../../model/geometry_model.dart';
 
+/// Triangulates polygons into one vertex buffer (x, y, z per vertex, in the
+/// tile's clip space) and one index buffer.
+///
+/// Vertices and indices go straight into growing typed buffers, and one list
+/// of ring coordinates serves every polygon. A vertex list, an index list
+/// and their copies per polygon, joined through a `BytesBuilder`, were
+/// garbage on the map's worker isolates, whose collections pause the UI
+/// thread too.
 class PolygonGeometryBuilder {
+  /// [expectedPoints], the number of ring points in the polygons to build,
+  /// sizes the first buffers (3 floats per point; about one triangle per
+  /// point); they still grow when it is too small.
+  PolygonGeometryBuilder({int? expectedPoints})
+      : _vertices = Float32List(
+            expectedPoints == null ? 3072 : max(16, expectedPoints * 3)),
+        _indices = Uint32List(
+            expectedPoints == null ? 3072 : max(16, expectedPoints * 3));
+
+  Float32List _vertices;
+  int _vertexFloats = 0;
+  Uint32List _indices;
+  int _indexCount = 0;
+  final _flat = <double>[];
+  final _holeIndices = <int>[];
+
   (ByteData, ByteData) build(List<TilePolygon> polygons) {
-    final vertexBytesBuilder = BytesBuilder(copy: false);
-    final indexBytesBuilder = BytesBuilder(copy: false);
-
-    int offset = 0;
-
-    for (var polygon in polygons) {
-      final (vtx, idx) = _triangulate(polygon, offset);
-
-      offset += vtx.length ~/ 3;
-
-      vertexBytesBuilder.add(vtx.buffer.asUint8List());
-      indexBytesBuilder.add(idx.buffer.asUint8List());
+    var offset = 0;
+    for (final polygon in polygons) {
+      offset += _triangulate(polygon, offset);
     }
-
     return (
-      ByteData.sublistView(vertexBytesBuilder.takeBytes()),
-      ByteData.sublistView(indexBytesBuilder.takeBytes())
+      ByteData.sublistView(_vertices, 0, _vertexFloats),
+      ByteData.sublistView(_indices, 0, _indexCount),
     );
   }
 
-  (Float32List, Uint32List) _triangulate(TilePolygon polygon, int offset) {
-    final flat = <double>[];
-    final holeIndices = <int>[];
-
-    for (int i = 0; i < polygon.rings.length; i++) {
-      final ring = polygon.rings[i];
-
+  /// Adds [polygon]'s vertices, and its triangles with indices shifted by
+  /// [offset]. Returns its vertex count.
+  int _triangulate(TilePolygon polygon, int offset) {
+    final flat = _flat..clear();
+    final holeIndices = _holeIndices..clear();
+    for (var i = 0; i < polygon.rings.length; i++) {
       if (i > 0) {
         holeIndices.add(flat.length ~/ 2);
       }
-
-      for (final point in ring.points) {
-        flat.add(point.x.toDouble());
-        flat.add(point.y.toDouble());
+      for (final point in polygon.rings[i].points) {
+        flat
+          ..add(point.x.toDouble())
+          ..add(point.y.toDouble());
       }
     }
 
-    final indices = Earcut.triangulateRaw(flat, holeIndices: holeIndices);
-    final vertices = Float32List((flat.length * 1.5).truncate());
+    final triangles = Earcut.triangulateRaw(flat, holeIndices: holeIndices);
 
-    int ptr = 0;
-
+    final vertexCount = flat.length ~/ 2;
+    var v = _addVertexFloats(vertexCount * 3);
+    final vertices = _vertices;
     for (var i = 0; i < flat.length; i += 2) {
-      final x = flat[i];
-      final y = flat[i + 1];
-
-      vertices[ptr] = x / 2048.0 - 1;
-      vertices[ptr + 1] = 1 - y / 2048.0;
-      vertices[ptr + 2] = 0.0;
-
-      ptr += 3;
+      vertices[v] = flat[i] / 2048.0 - 1;
+      vertices[v + 1] = 1 - flat[i + 1] / 2048.0;
+      vertices[v + 2] = 0.0;
+      v += 3;
     }
 
-    return (
-      vertices,
-      Uint32List.fromList(
-          indices.map((it) => it + offset).toList(growable: false))
-    );
+    var k = _addIndices(triangles.length);
+    final indices = _indices;
+    for (final index in triangles) {
+      indices[k++] = index + offset;
+    }
+    return vertexCount;
+  }
+
+  /// Reserves [count] floats of vertex data and returns the first's index.
+  int _addVertexFloats(int count) {
+    final start = _vertexFloats;
+    final end = start + count;
+    if (end > _vertices.length) {
+      _vertices = Float32List(max(end, _vertices.length * 2))
+        ..setRange(0, start, _vertices);
+    }
+    _vertexFloats = end;
+    return start;
+  }
+
+  /// Reserves [count] indices and returns the first's index.
+  int _addIndices(int count) {
+    final start = _indexCount;
+    final end = start + count;
+    if (end > _indices.length) {
+      _indices = Uint32List(max(end, _indices.length * 2))
+        ..setRange(0, start, _indices);
+    }
+    _indexCount = end;
+    return start;
   }
 }

@@ -15,6 +15,19 @@ class AtlasSet {
     }
     return null;
   }
+
+  /// Whether these atlases hold every character of [glyphs] (the characters
+  /// each font needs).
+  bool covers(Map<String, Set<int>> glyphs) {
+    for (final MapEntry(key: font, value: charCodes) in glyphs.entries) {
+      for (final charCode in charCodes) {
+        if (getAtlasForChar(charCode, font) == null) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 }
 
 class AtlasID {

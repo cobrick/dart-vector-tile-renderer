@@ -54,12 +54,14 @@ class ScenePolygonBuilder {
     }
 
     featureGroups.forEach((paint, group) {
-      addMesh(group.polygons, paint);
+      addMesh(group.polygons, paint, expectedPoints: group.size);
     });
   }
 
-  void addMesh(List<TilePolygon> polygons, PaintModel paint) {
-    final (vertices, indices) = PolygonGeometryBuilder().build(polygons);
+  void addMesh(List<TilePolygon> polygons, PaintModel paint,
+      {int? expectedPoints}) {
+    final (vertices, indices) =
+        PolygonGeometryBuilder(expectedPoints: expectedPoints).build(polygons);
 
     final color = paint.color.vector4;
 
