@@ -2,6 +2,8 @@ import 'dart:typed_data';
 
 import 'package:flutter_gpu/gpu.dart' as gpu;
 
+import 'static_uniform.dart';
+
 /// Base class for the tile renderer's geometries: a vertex shader and the
 /// vertex (and optional index) buffer it reads.
 ///
@@ -20,6 +22,9 @@ abstract class TileGeometry {
   gpu.IndexType _indexType = gpu.IndexType.int16;
   int _indexCount = 0;
   bool _indexed = false;
+
+  /// The uniform blocks that never change, uploaded once with the tile.
+  List<StaticUniform> get staticUniforms => const [];
 
   void setVertexShader(gpu.Shader shader) {
     vertexShader = shader;

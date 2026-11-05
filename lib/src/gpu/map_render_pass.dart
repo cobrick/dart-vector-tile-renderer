@@ -16,6 +16,10 @@ class MapDraw {
   final TileGeometry geometry;
   final MapMaterial material;
 
+  /// The pipeline for this mesh's shaders, looked up on its first draw.
+  late final gpu.RenderPipeline pipeline =
+      MapRenderPass._pipeline(geometry.vertexShader, material.fragmentShader);
+
   bool get isDrawable => !geometry.isEmpty && material.isDrawable;
 }
 
@@ -39,23 +43,50 @@ class TileFrame {
 /// painted under the neighbour's higher layers, not over them.
 List<(int, int)> layerMajorOrder(List<List<int>> layersPerTile) {
   final order = <(int, int)>[];
-  final cursors = List<int>.filled(layersPerTile.length, 0);
+  walkLayerMajorOrder(
+    layersPerTile.length,
+    (tile) => layersPerTile[tile].length,
+    (tile, mesh) => layersPerTile[tile][mesh],
+    (tile, mesh) => order.add((tile, mesh)),
+  );
+  return order;
+}
+
+/// Calls [visit] for every mesh of [tileCount] tiles in [layerMajorOrder],
+/// without building the order: [meshCount] is a tile's number of meshes
+/// and [layerOf] a mesh's style layer, ascending within each tile.
+///
+/// The render pass walks the order every frame; building it made an
+/// object per mesh per frame for the UI isolate's collector.
+void walkLayerMajorOrder(
+  int tileCount,
+  int Function(int tile) meshCount,
+  int Function(int tile, int mesh) layerOf,
+  void Function(int tile, int mesh) visit,
+) {
+  final cursors = List<int>.filled(tileCount, 0);
   while (true) {
-    int? layer;
-    for (var t = 0; t < layersPerTile.length; t++) {
-      final layers = layersPerTile[t];
+    var found = false;
+    var layer = 0;
+    for (var t = 0; t < tileCount; t++) {
       final c = cursors[t];
-      if (c < layers.length && (layer == null || layers[c] < layer)) {
-        layer = layers[c];
+      if (c < meshCount(t)) {
+        final l = layerOf(t, c);
+        if (!found || l < layer) {
+          layer = l;
+          found = true;
+        }
       }
     }
-    if (layer == null) return order;
-    for (var t = 0; t < layersPerTile.length; t++) {
-      final layers = layersPerTile[t];
-      while (cursors[t] < layers.length && layers[cursors[t]] == layer) {
-        order.add((t, cursors[t]));
-        cursors[t]++;
+    if (!found) return;
+    for (var t = 0; t < tileCount; t++) {
+      final count = meshCount(t);
+      var c = cursors[t];
+      while (c < count && layerOf(t, c) == layer) {
+        visit(t, c);
+        c++;
       }
+      cursors[t] = c;
     }
   }
 }
@@ -85,12 +116,19 @@ class MapRenderPass {
 
   static final _pipelines = <(gpu.Shader, gpu.Shader), gpu.RenderPipeline>{};
 
+  static gpu.RenderPipeline _pipeline(gpu.Shader vertex, gpu.Shader fragment) =>
+      _pipelines[(vertex, fragment)] ??=
+          gpu.gpuContext.createRenderPipeline(vertex, fragment);
+
   final _colors = <gpu.Texture>[];
   int _cursor = 0;
   int _width = 0;
   int _height = 0;
   gpu.Texture? _msaaColor;
   gpu.HostBuffer? _host;
+
+  // This frame's FrameInfo per tile, reused frame to frame.
+  final _frameInfos = <gpu.BufferView>[];
 
   /// Draws [tiles] into a [width]×[height] pixel target and paints it into
   /// [destination] on [canvas]. [camera] maps the tiles' clip space to
@@ -146,41 +184,43 @@ class MapRenderPass {
     Matrix4 camera,
   ) {
     // One FrameInfo uniform per tile, shared by all of the tile's meshes.
-    final frameInfos = [
-      for (final tile in tiles)
-        host.emplace(_frameInfo(tile.transform, camera)),
-    ];
-    final order = layerMajorOrder([
-      for (final tile in tiles) [for (final d in tile.draws) d.layer],
-    ]);
-    gpu.RenderPipeline? bound;
-    for (final (t, i) in order) {
-      final draw = tiles[t].draws[i];
-      if (!draw.isDrawable) continue;
-      final vertexShader = draw.geometry.vertexShader;
-      final fragmentShader = draw.material.fragmentShader;
-      final pipeline = _pipelines[(vertexShader, fragmentShader)] ??=
-          gpu.gpuContext.createRenderPipeline(vertexShader, fragmentShader);
-      pass.clearBindings();
-      if (!identical(pipeline, bound)) {
-        pass.bindPipeline(pipeline);
-        bound = pipeline;
-      }
-      draw.geometry.bind(pass, host, frameInfos[t]);
-      draw.material.bind(pass, host);
-      draw.geometry.draw(pass);
+    final frameInfos = _frameInfos..clear();
+    for (final tile in tiles) {
+      frameInfos.add(host.emplace(_frameInfo(tile.transform, camera)));
     }
+    gpu.RenderPipeline? bound;
+    walkLayerMajorOrder(
+      tiles.length,
+      (t) => tiles[t].draws.length,
+      (t, i) => tiles[t].draws[i].layer,
+      (t, i) {
+        final draw = tiles[t].draws[i];
+        if (!draw.isDrawable) return;
+        final pipeline = draw.pipeline;
+        pass.clearBindings();
+        if (!identical(pipeline, bound)) {
+          pass.bindPipeline(pipeline);
+          bound = pipeline;
+        }
+        draw.geometry.bind(pass, host, frameInfos[t]);
+        draw.material.bind(pass, host);
+        draw.geometry.draw(pass);
+      },
+    );
   }
 
   // std140 FrameInfo { mat4 model_transform; mat4 camera_transform;
   // vec3 camera_position; }. The camera position only feeds a varying the
-  // fragment shaders ignore; it keeps flutter_scene's former value.
+  // fragment shaders ignore; it keeps flutter_scene's former value. One
+  // scratch block for every tile: emplace copies it.
+  static final _frameInfoData = Float32List(36)..[34] = -1000000;
+  static final _frameInfoBytes = ByteData.sublistView(_frameInfoData);
+
   static ByteData _frameInfo(Matrix4 model, Matrix4 camera) {
-    final data = Float32List(36)
+    _frameInfoData
       ..setRange(0, 16, model.storage)
-      ..setRange(16, 32, camera.storage)
-      ..[34] = -1000000;
-    return ByteData.sublistView(data);
+      ..setRange(16, 32, camera.storage);
+    return _frameInfoBytes;
   }
 
   gpu.Texture _nextColorTarget(int width, int height) {

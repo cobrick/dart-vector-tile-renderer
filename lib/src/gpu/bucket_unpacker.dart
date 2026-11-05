@@ -7,6 +7,7 @@ import 'map_material.dart';
 import 'map_render_pass.dart';
 import 'polygon/polygon_geometry.dart';
 import 'raster/raster_layer_builder.dart';
+import 'static_uniform.dart';
 import 'text/text_geometry.dart';
 import 'text/text_material.dart';
 import 'texture_provider.dart';
@@ -35,6 +36,12 @@ class BucketUnpacker {
             _unpackMaterial(packed.material)));
       }
     }
+    uploadStaticUniforms([
+      for (final draw in draws) ...[
+        ...draw.geometry.staticUniforms,
+        ...draw.material.staticUniforms,
+      ],
+    ]);
     return draws;
   }
 

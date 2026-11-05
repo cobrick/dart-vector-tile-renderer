@@ -4,6 +4,7 @@ import 'package:flutter_gpu/gpu.dart' as gpu;
 
 import '../map_material.dart';
 import '../shaders.dart';
+import '../static_uniform.dart';
 
 /// A raster tile's texture at the layer's opacity.
 class RasterMaterial extends MapMaterial {
@@ -14,8 +15,8 @@ class RasterMaterial extends MapMaterial {
   })  : _texture = colorTexture,
         // FragInfo { vec4 color; float vertex_color_weight; }: white at the
         // layer opacity, vertex colour weight 1 (the former unlit default).
-        _fragInfo = ByteData.sublistView(
-            Float32List.fromList([1.0, 1.0, 1.0, opacity, 1.0])),
+        _fragInfo = StaticUniform(ByteData.sublistView(
+            Float32List.fromList([1.0, 1.0, 1.0, opacity, 1.0]))),
         _sampler = resampling == 0.0
             ? gpu.SamplerOptions()
             : gpu.SamplerOptions(
@@ -28,7 +29,7 @@ class RasterMaterial extends MapMaterial {
         super(shaderLibrary['RasterFragment']!);
 
   final gpu.Texture _texture;
-  final ByteData _fragInfo;
+  final StaticUniform _fragInfo;
   final gpu.SamplerOptions _sampler;
 
   late final gpu.UniformSlot _fragInfoSlot =
@@ -37,8 +38,11 @@ class RasterMaterial extends MapMaterial {
       fragmentShader.getUniformSlot('base_color_texture');
 
   @override
+  List<StaticUniform> get staticUniforms => [_fragInfo];
+
+  @override
   void bind(gpu.RenderPass pass, gpu.HostBuffer host) {
-    pass.bindUniform(_fragInfoSlot, host.emplace(_fragInfo));
+    pass.bindUniform(_fragInfoSlot, _fragInfo.view(host));
     pass.bindTexture(_textureSlot, _texture, sampler: _sampler);
   }
 }
