@@ -19,14 +19,17 @@ abstract class TileGeometry {
   gpu.BufferView? _indices;
   gpu.IndexType _indexType = gpu.IndexType.int16;
   int _indexCount = 0;
+  bool _indexed = false;
 
   void setVertexShader(gpu.Shader shader) {
     vertexShader = shader;
   }
 
-  /// Whether there is nothing to draw.
+  /// Whether there is nothing to draw. An indexed geometry whose index data
+  /// is empty (e.g. earcut found no triangles) draws nothing, rather than
+  /// its vertices as an unindexed triangle list.
   bool get isEmpty =>
-      _vertices == null || (_indices == null ? _vertexCount : _indexCount) == 0;
+      _vertices == null || (_indexed ? _indexCount : _vertexCount) == 0;
 
   /// Uploads [vertices] (and [indices], if any) into one host-visible device
   /// buffer, indices right after the vertices.
@@ -51,6 +54,7 @@ abstract class TileGeometry {
       lengthInBytes: vertices.lengthInBytes,
     );
     _vertexCount = vertexCount;
+    _indexed = indices != null;
     if (indices != null && indexBytes > 0) {
       buffer.overwrite(indices,
           destinationOffsetInBytes: vertices.lengthInBytes);
@@ -76,7 +80,7 @@ abstract class TileGeometry {
   }
 
   void draw(gpu.RenderPass pass) {
-    if (_indices != null) {
+    if (_indexed) {
       pass.drawIndexed(_indexCount);
     } else {
       pass.draw(_vertexCount);

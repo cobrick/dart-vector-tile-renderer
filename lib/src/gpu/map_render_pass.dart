@@ -219,6 +219,9 @@ class MapRenderPass {
 
   void dispose() {
     _colors.clear();
+    _cursor = 0;
+    _width = 0;
+    _height = 0;
     _msaaColor = null;
     _host = null;
   }

@@ -16,6 +16,7 @@ import 'map_render_pass.dart';
 import 'position_transform.dart';
 import 'shaders.dart';
 import 'text/atlas_creating_text_visitor.dart';
+import 'text/text_material.dart';
 import 'tile_prerenderer.dart';
 import 'tile_render_data.dart';
 
@@ -80,7 +81,7 @@ class TilesRenderer with WidgetsBindingObserver {
   // Labels fade in over this long after their tile is built (the text
   // shader's `Age` uniform), plus a frame or two of margin.
   static const _labelFadeIn = Duration(milliseconds: 550);
-  final _sinceLastBuild = Stopwatch();
+  final _sinceLabelsBuilt = Stopwatch();
   final AtlasProvider _atlasProvider = AtlasProvider();
   final TextureProvider _textureProvider = TextureProvider();
   late final _atlasGenerator = AtlasGenerator(
@@ -128,9 +129,7 @@ class TilesRenderer with WidgetsBindingObserver {
   /// waiting to be built, or labels of a recently built tile are fading in.
   bool get needsAnotherFrame =>
       _lastUpdateDeferred ||
-      (_labelsOnly &&
-          _sinceLastBuild.isRunning &&
-          _sinceLastBuild.elapsed < _labelFadeIn);
+      (_sinceLabelsBuilt.isRunning && _sinceLabelsBuilt.elapsed < _labelFadeIn);
 
   Uint8List Function(Theme theme, double zoom, Tileset tileset, String tileID)
       getPreRenderer() {
@@ -202,9 +201,11 @@ class TilesRenderer with WidgetsBindingObserver {
         draws = BucketUnpacker(_textureProvider, model.rasterTileset)
             .unpack(TileRenderData.unpack(renderData));
         newUploads++;
-        _sinceLastBuild
-          ..reset()
-          ..start();
+        if (draws.any((draw) => draw.material is TextMaterial)) {
+          _sinceLabelsBuilt
+            ..reset()
+            ..start();
+        }
       }
       _positionByKey[key] = model.position;
       active[key] = draws;
@@ -226,7 +227,9 @@ class TilesRenderer with WidgetsBindingObserver {
 
   void _cacheTile(String key, List<MapDraw> draws) {
     final capacity = GpuMapSettings.tileNodeCacheCapacity;
-    if (capacity <= 0) {
+    // A tile built without its glyph atlas would come back without labels;
+    // let it reload instead.
+    if (capacity <= 0 || draws.any((draw) => !draw.material.isDrawable)) {
       return;
     }
     _cachedByKey.remove(key);
